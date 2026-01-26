@@ -1,4 +1,4 @@
-function meshes = mesh_labeled_regions(label_volume, ds_hires, k, HU_hires, ~)
+function meshes = mesh_labeled_regions(label_volume, ds_hires, k, ~)
 % MESH_LABELED_REGIONS — Per-label watertight meshes using
 % "closest-other + mask-complement" distance formulation (no outer SDF).
 %
@@ -6,7 +6,6 @@ function meshes = mesh_labeled_regions(label_volume, ds_hires, k, HU_hires, ~)
 %   label_volume : uint* 3D label array (0 = air)
 %   ds_hires.spacing : 1x3 mm
 %   k : number of labels (1..k)
-%   HU_hires : unused (kept for signature compatibility)
 % OUTPUT
 %   meshes : kx1 cell of structs {vertices (mm), faces}
 

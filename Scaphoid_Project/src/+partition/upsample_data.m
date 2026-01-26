@@ -77,7 +77,6 @@ HU_hires(~mask_hires) = NaN;
 ds_hires = struct();
 ds_hires.spacing = spacing / f;                % mm/voxel at hi-res
 ds_hires.size    = targetSz;
-ds_hires.size_vox_hires = targetSz;            % back-compat name if used elsewhere
 
 % Pass through helpful geometry fields if present
 pass = {'origin','dir_row','dir_col','dir_slice','M_voxToLPS','PatientName','SeriesDescription'};

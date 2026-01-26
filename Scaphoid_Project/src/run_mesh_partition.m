@@ -156,7 +156,7 @@ fprintf('[TIMER] Step 3 total: %.3f s\n\n', toc(t_all_step3));
 % ---------- Step 4: Generate region meshes ----------
 fprintf('--- Step 4: Generating %d Meshes from Labeled Volume ---\n', k);
 tic;
-meshes = partition.mesh_labeled_regions(labels_final_hires, hires_data.ds, k, hires_data.HU);
+meshes = partition.mesh_labeled_regions(labels_final_hires, hires_data.ds, k);
 fprintf('Mesh generation complete. (%.2f seconds)\n\n', toc);
 
 % ---------- Step 5: (Optional) Clip against shell ----------
