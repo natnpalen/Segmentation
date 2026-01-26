@@ -489,7 +489,11 @@ end
 lambda     = opts.BoundaryScoreLambda;
 needSingle = opts.BoundaryMustBeSingleComponent;
 t_base = median(ths);
-B_base = imsegfmm(W, seedMask, t_base);
+% NOTE: imsegfmm is expensive; we reuse the distance map D and threshold it
+%       for each candidate. Large opts.FMMNumSteps still increases downstream
+%       scoring cost (perimeter + HU stats), even though front propagation is
+%       computed only once.
+B_base = D <= t_base;
 if needSingle
    B_base = utils.keep_largest_component_3d(B_base);
 end
@@ -518,7 +522,7 @@ best    = s_edge0 - lambda * penHU0 - penVol0;
 BWbest  = B_base;
 for t = ths
    t = min(max(t, eps), 0.999);
-   B = imsegfmm(W, seedMask, t);
+   B = D <= t;
    if needSingle
        B = utils.keep_largest_component_3d(B);
    end
