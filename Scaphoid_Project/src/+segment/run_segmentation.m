@@ -25,10 +25,14 @@ ds.artifactWeight = utils.paste_crop_volume(artifactW_c,        crop, size(ds.HU
 % Optional sheetness prior
 S_c = [];
 if opts.UseSheetnessPrior
-    fprintf('[Sheetness] sigmas(mm)=%s, weight=%.2f\n', mat2str(opts.SheetnessSigmasMM), opts.SheetnessWeight);
+    fprintf('[Sheetness] sigmas(mm)=%s, weight=%.2f (expensive multi-scale filter)\n', ...
+        mat2str(opts.SheetnessSigmasMM), opts.SheetnessWeight);
     S_c = computeSheetness3D(HUc, ds.spacing, opts.SheetnessSigmasMM, ...
                              [opts.SheetnessAlpha, opts.SheetnessBeta, opts.SheetnessC], ...
-                             opts.SheetnessBrightStructures);
+                             opts.SheetnessBrightStructures, ...
+                             'DownsampleFactor', opts.SheetnessDownsampleFactor, ...
+                             'MaxSigmaMM', opts.SheetnessMaxSigmaMM, ...
+                             'SigmaSpacingCap', opts.SheetnessSigmaSpacingCap);
 end
 
 % Seed (with quality guard + auto-reseat if HU too low)
@@ -578,25 +582,62 @@ end
 BW = imclearborder(BW, 26);
 end
 
-function S = computeSheetness3D(HU, spacing, sigmasMM, frangiABC, brightStructures)
+function S = computeSheetness3D(HU, spacing, sigmasMM, frangiABC, brightStructures, varargin)
 if nargin<5, brightStructures = true; end
 if isempty(sigmasMM), S = zeros(size(HU),'like',HU); return; end
 sigmasMM = sigmasMM(:).';
-[R,C,Sz] = size(HU);
-S_all = zeros(R,C,Sz,'like',HU);
+opts = struct('DownsampleFactor', 1, 'MaxSigmaMM', [], 'SigmaSpacingCap', []);
+if ~isempty(varargin)
+    for k = 1:2:numel(varargin)
+        opts.(varargin{k}) = varargin{k+1};
+    end
+end
+if ~isempty(opts.MaxSigmaMM)
+    sigmasMM = sigmasMM(sigmasMM <= opts.MaxSigmaMM);
+end
+if ~isempty(opts.SigmaSpacingCap) && opts.SigmaSpacingCap > 0
+    sigmasMM = sigmasMM(sigmasMM <= opts.SigmaSpacingCap * max(spacing));
+end
+if isempty(sigmasMM)
+    S = zeros(size(HU),'like',HU);
+    return;
+end
+V = double(HU);
+if opts.DownsampleFactor > 1
+    dsFactor = opts.DownsampleFactor;
+    V_ds = imresize3(V, 1 / dsFactor, 'linear');
+    spacing_ds = spacing * dsFactor;
+    S_ds = computeSheetnessCore(V_ds, spacing_ds, sigmasMM, frangiABC, brightStructures);
+    S = imresize3(S_ds, size(V), 'linear');
+    return;
+end
+S = computeSheetnessCore(V, spacing, sigmasMM, frangiABC, brightStructures);
+end
+function S = computeSheetnessCore(V, spacing, sigmasMM, frangiABC, brightStructures)
+[R,C,Sz] = size(V);
+S_all = zeros(R,C,Sz,'like',V);
 sx = spacing(1); sy = spacing(2); sz = spacing(3);
 for s = sigmasMM
  sigx = s / max(sx,eps); sigy = s / max(sy,eps); sigz = s / max(sz,eps);
  kx = max(2, ceil(3*sigx)); ky = max(2, ceil(3*sigy)); kz = max(2, ceil(3*sigz));
  gx  = gauss1d(sigx, kx);   gy  = gauss1d(sigy, ky);   gz  = gauss1d(sigz, kz);
  g2x = gauss1d_second(sigx, kx); g2y = gauss1d_second(sigy, ky); g2z = gauss1d_second(sigz, kz);
- V = double(HU);
- Hxx = imfilter(imfilter(imfilter(V, g2x','replicate','same'), gy ,'replicate','same'), gz ,'replicate','same') * (s^2);
- Hyy = imfilter(imfilter(imfilter(V, gx' ,'replicate','same'), g2y,'replicate','same'), gz ,'replicate','same') * (s^2);
- Hzz = imfilter(imfilter(imfilter(V, gx' ,'replicate','same'), gy ,'replicate','same'), g2z,'replicate','same') * (s^2);
- Hxy = imfilter(imfilter(imfilter(V, gauss1d_first(sigx,kx)','replicate','same'), gauss1d_first(sigy,ky),'replicate','same'), gz ,'replicate','same') * (s^2);
- Hxz = imfilter(imfilter(imfilter(V, gauss1d_first(sigx,kx)','replicate','same'), gy ,'replicate','same'), gauss1d_first(sigz,kz),'replicate','same') * (s^2);
- Hyz = imfilter(imfilter(imfilter(V, gx' ,'replicate','same'), gauss1d_first(sigy,ky),'replicate','same'), gauss1d_first(sigz,kz),'replicate','same') * (s^2);
+ g1x = gauss1d_first(sigx, kx); g1y = gauss1d_first(sigy, ky); g1z = gauss1d_first(sigz, kz);
+ Vx   = imfilter(V, gx', 'replicate','same');
+ Vxx  = imfilter(V, g2x','replicate','same');
+ Vx1  = imfilter(V, g1x','replicate','same');
+ Vxy  = imfilter(Vx,  gy,  'replicate','same');
+ Vx_y2 = imfilter(Vx,  g2y,'replicate','same');
+ Vx_y1 = imfilter(Vx,  g1y,'replicate','same');
+ Vxx_y = imfilter(Vxx, gy,  'replicate','same');
+ Vx1_y = imfilter(Vx1, gy,  'replicate','same');
+ Vx1_y1 = imfilter(Vx1, g1y,'replicate','same');
+ Hxx = imfilter(Vxx_y, gz, 'replicate','same') * (s^2);
+ Hyy = imfilter(Vx_y2, gz, 'replicate','same') * (s^2);
+ Hzz = imfilter(Vxy,  g2z,'replicate','same') * (s^2);
+ Hxy = imfilter(Vx1_y1, gz, 'replicate','same') * (s^2);
+ Hxz = imfilter(Vx1_y, g1z,'replicate','same') * (s^2);
+ Hyz = imfilter(Vx_y1, g1z,'replicate','same') * (s^2);
  [l1,l2,l3] = eigvals3sym(Hxx,Hyy,Hzz,Hxy,Hxz,Hyz);
  if brightStructures
      l2n = -l2; l3n = -l3;
