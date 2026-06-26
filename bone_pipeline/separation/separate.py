@@ -1,17 +1,27 @@
 """
 Bone separation — faithful port of the scaphoid pipeline's segmentation
-strategy (+segment/run_segmentation.m).
+strategy (+segment/run_segmentation.m), adapted for multi-bone excised
+specimens scanned in air.
+
+Key adaptations from the single-bone scaphoid pipeline:
+  - Specimen isolation keeps ALL non-air components (not just the largest)
+  - Physical-space morphological closing via distance transforms (handles
+    anisotropic voxel spacing correctly)
+  - Per-slice 2D hole-filling captures air-filled marrow cavities that
+    binary reconstruction cannot reach (replaces FMM's ability to
+    traverse unfavourable regions via continuous cost)
+  - softMed is capped for threshold computation so that excised-in-air
+    scans (where softMed is high due to no soft tissue) don't produce
+    aggressively high carving thresholds
 
 Pipeline stages:
   1. Specimen isolation (non-air, all significant components)
   2. Marker detection with Gaussian falloff artifact weighting
-  3. Adaptive constraint sweep: Loose/Medium/Strict (HU-offset, grad-percentile)
-     pairs each produce a candidate via morphological reconstruction through
-     OR-logic allow regions.  Candidates scored by 90th-percentile surface HU.
-  4. Morphological closing to bridge trabecular gaps
-  5. Boundary-band cling with deep-interior protection (>=1 mm always kept)
+  3. Adaptive constraint sweep with OR-logic allow regions
+  4. Morphological reconstruction + closing + interior fill
+  5. Boundary-band cling with deep-interior protection
   6. Edge-backed perimeter prune
-  7. Conservative boundary carve (multi-condition near air)
+  7. Conservative boundary carve
   8. Final boundary carve
   9. Connected components -> individual bones
  10. Tag-to-bone association by proximity
@@ -33,11 +43,6 @@ from .dicom_io import load_dicom_series
 def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
                    closing_radius_mm=2.0):
     """Separate individual bones from a multi-bone DICOM CT scan.
-
-    Uses the same multi-stage strategy as the scaphoid MATLAB pipeline:
-    adaptive constraint sweep with OR-logic allow regions, morphological
-    reconstruction from dense core seeds, boundary-band cling with deep-
-    interior protection, and multi-pass perimeter carving.
 
     Parameters
     ----------
@@ -62,7 +67,6 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 
     vol = volume.astype(np.float32)
     voxel_vol = float(np.prod(spacing))
-    mean_sp = float(np.mean(spacing))
     conn26 = np.ones((3, 3, 3), dtype=bool)
 
     # === Stage 1: Specimen isolation ===
@@ -72,9 +76,6 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 
     # === Stage 2: Marker & artifact detection ===
     print("  Stage 2: Marker & artifact detection...")
-    # Detect tags in the FULL volume — they may be in separate non-air
-    # components from the bones (the scaphoid pipeline only had one bone,
-    # so restricting to specimen was fine; for multi-bone it drops tags).
     lead_mask = vol > tag_hu_min
     marker_mask = lead_mask.copy()
     if np.any(lead_mask):
@@ -93,11 +94,18 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
     tag_components = _find_tags(lead_mask, spacing, voxel_vol)
     print(f"    Found {len(tag_components)} metal tags")
 
-    # === Stage 3: Adaptive thresholds (anchored to softMed) ===
+    # === Stage 3: Adaptive thresholds ===
     print("  Stage 3: Adaptive bone detection...")
 
     non_bg = vol[specimen & (vol > -300)]
-    softMed = float(np.median(non_bg)) if len(non_bg) > 0 else -300.0
+    softMed_raw = float(np.median(non_bg)) if len(non_bg) > 0 else -300.0
+
+    # Cap softMed for threshold computation.  The MATLAB thresholds
+    # (hu_floor, carve floors) assume softMed is in the range -300..0
+    # (clinical scan with soft tissue).  For excised-in-air specimens
+    # softMed is much higher (all non-air material is bone) which makes
+    # the derived thresholds far too aggressive.
+    softMed = min(softMed_raw, 0.0)
 
     vals_mask = specimen & ~marker_dil & (vol > -300) & (vol < 2000)
     vals = vol[vals_mask]
@@ -118,8 +126,8 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
                 print(f"    Core relaxed to p{p} (thr={alt:.0f})")
                 break
 
-    print(f"    softMed={softMed:.0f}, core_thr={core_thr:.0f}, "
-          f"core={np.sum(core) * voxel_vol:.0f} mm³")
+    print(f"    softMed_raw={softMed_raw:.0f}, softMed_capped={softMed:.0f}, "
+          f"core_thr={core_thr:.0f}, core={np.sum(core) * voxel_vol:.0f} mm³")
 
     # === Stage 4: Constraint sweep ===
     constraints = [
@@ -184,33 +192,40 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
         bone_mask = _reconstruct(seed_dil, allowed) if np.any(core) else allowed
         bone_mask = _remove_tiny(bone_mask, 200)
 
-    # Morphological closing to bridge trabecular gaps
-    close_r = max(1, int(round(closing_radius_mm / mean_sp)))
-    bone_mask = ndimage.binary_closing(bone_mask, structure=ball(close_r))
+    # Physical-space closing to bridge trabecular gaps, then fill interior
+    bone_mask = _physical_close(bone_mask, closing_radius_mm, spacing)
+
+    # Per-slice 2D fill captures air-filled marrow cavities that
+    # reconstruction cannot reach (the key gap vs. MATLAB's FMM)
+    for z in range(bone_mask.shape[0]):
+        bone_mask[z] = ndimage.binary_fill_holes(bone_mask[z])
     bone_mask = ndimage.binary_fill_holes(bone_mask)
     bone_mask = bone_mask & specimen
 
-    print(f"    After reconstruction + closing: "
+    print(f"    After reconstruction + closing + fill: "
           f"{np.sum(bone_mask) * voxel_vol:.0f} mm³")
 
-    # === Stage 5: Boundary refinement (matching MATLAB) ===
+    # === Stage 5: Boundary refinement ===
     print("  Stage 5: Boundary refinement...")
 
-    # 5a. Boundary-band cling with interior protection
     bone_mask = _boundary_cling(bone_mask, vol, G, spacing, vals,
                                 softMed, conn26)
+    vol_after_cling = np.sum(bone_mask) * voxel_vol
 
-    # 5b. Edge-backed perimeter prune
     bone_mask = _edge_prune(bone_mask, vol, G, softMed, conn26)
+    vol_after_prune = np.sum(bone_mask) * voxel_vol
 
-    # 5c. Conservative boundary carve
     bone_mask = _boundary_carve(bone_mask, vol, G, spacing, softMed,
                                 core, conn26)
+    vol_after_carve = np.sum(bone_mask) * voxel_vol
 
-    # 5d. Final boundary carve
     bone_mask = _final_carve(bone_mask, vol, softMed, conn26)
+    vol_after_final = np.sum(bone_mask) * voxel_vol
 
-    # Final cleanup (no keep-largest — we want multiple bones)
+    print(f"    cling={vol_after_cling:.0f}, prune={vol_after_prune:.0f}, "
+          f"carve={vol_after_carve:.0f}, final={vol_after_final:.0f} mm³")
+
+    # Final cleanup (no keep-largest — multi-bone)
     bone_mask = opening(bone_mask, ball(1))
     bone_mask = ndimage.binary_closing(bone_mask, structure=ball(1))
     bone_mask = ndimage.binary_fill_holes(bone_mask)
@@ -255,21 +270,38 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 
 
 # ---------------------------------------------------------------------------
+# Helpers — morphological operations with correct physical spacing
+# ---------------------------------------------------------------------------
+
+def _physical_close(mask, radius_mm, spacing):
+    """Morphological closing with correct physical radius.
+
+    Uses distance transforms instead of structuring elements, which
+    naturally handles anisotropic voxel spacing.  With ball(r) and
+    spacing (0.5, 0.25, 0.25), a radius of 6 voxels is 3mm in Z but
+    only 1.5mm in X/Y.  This function gives a true spherical closing.
+    """
+    dt_bg = ndimage.distance_transform_edt(~mask, sampling=spacing)
+    dilated = dt_bg <= radius_mm
+    dt_fg = ndimage.distance_transform_edt(dilated, sampling=spacing)
+    return dt_fg >= radius_mm
+
+
+# ---------------------------------------------------------------------------
 # Helpers — specimen & markers
 # ---------------------------------------------------------------------------
 
 def _isolate_specimen(vol, spacing):
-    """All non-air material after generous closing and hole-filling.
+    """All non-air material with physical-space closing and interior fill.
 
-    The MATLAB scaphoid pipeline takes only the largest non-air component
-    because it segments a single bone.  For multi-bone scans the bones are
-    separated by air, so we keep ALL significant non-air components.  A
-    generous closing (2 mm radius) bridges internal trabecular porosity so
-    each bone forms a single connected region.
+    Generous closing (3 mm) bridges internal trabecular porosity.
+    Per-slice 2D fill captures enclosed marrow cavities.  All components
+    above 50 mm³ are kept (not just the largest — multi-bone adaptation).
     """
     non_air = vol > -500
-    r = max(2, int(round(2.0 / np.mean(spacing))))
-    non_air = ndimage.binary_closing(non_air, structure=ball(r))
+    non_air = _physical_close(non_air, 3.0, spacing)
+    for z in range(non_air.shape[0]):
+        non_air[z] = ndimage.binary_fill_holes(non_air[z])
     non_air = ndimage.binary_fill_holes(non_air)
     voxel_vol = float(np.prod(spacing))
     min_vox = max(100, int(50.0 / voxel_vol))
@@ -323,8 +355,7 @@ def _reconstruct(seed, mask):
     """Binary morphological reconstruction (imreconstruct equivalent).
 
     Keeps all connected components of *mask* that contain at least one
-    *seed* voxel.  O(n) via connected-component labelling — orders of
-    magnitude faster than iterative dilation.
+    *seed* voxel.  O(n) via connected-component labelling.
     """
     labeled, n = ndimage.label(mask)
     if n == 0:
@@ -341,7 +372,7 @@ def _perimeter(mask, conn26):
 
 
 def _perimeter_score(mask, vol, conn26):
-    """90th-percentile HU on the perimeter (MATLAB scoring criterion)."""
+    """90th-percentile HU on the perimeter."""
     if not np.any(mask):
         return -np.inf
     perim = _perimeter(mask, conn26)
@@ -371,10 +402,7 @@ def _boundary_cling(bone_mask, vol, G, spacing, vals, softMed, conn26):
     """Boundary-band cling with deep-interior protection.
 
     Deep interior (>=1 mm from surface) is unconditionally preserved.
-    The surface band (0-1 mm) is replaced with only the voxels that are
-    connected to dense surface seeds through an OR-logic support region.
-
-    MATLAB reference: +segment/run_segmentation.m lines 207-224.
+    Surface band replaced with voxels connected to dense surface seeds.
     """
     D_in = ndimage.distance_transform_edt(bone_mask, sampling=spacing)
     deep = D_in >= 1.0
@@ -405,12 +433,7 @@ def _boundary_cling(bone_mask, vol, G, spacing, vals, softMed, conn26):
 
 
 def _edge_prune(bone_mask, vol, G, softMed, conn26):
-    """Edge-backed perimeter prune.
-
-    Remove surface-band voxels that are BOTH low-HU AND low-gradient.
-
-    MATLAB reference: lines 226-236.
-    """
+    """Edge-backed perimeter prune: remove low-HU AND low-gradient surface."""
     perim = _perimeter(bone_mask, conn26)
     band1 = ndimage.binary_dilation(perim, structure=ball(1))
 
@@ -430,13 +453,7 @@ def _edge_prune(bone_mask, vol, G, softMed, conn26):
 
 
 def _boundary_carve(bone_mask, vol, G, spacing, softMed, core, conn26):
-    """Conservative boundary carve near air.
-
-    Remove perimeter-band voxels that are low-HU, near air, and not
-    protected by dense core.
-
-    MATLAB reference: lines 239-256.
-    """
+    """Conservative boundary carve: low-HU near air, not core-protected."""
     perim = _perimeter(bone_mask, conn26)
     band1 = ndimage.binary_dilation(perim, structure=ball(1))
     outer1 = ndimage.binary_dilation(bone_mask, structure=ball(1)) & ~bone_mask
@@ -466,10 +483,7 @@ def _boundary_carve(bone_mask, vol, G, spacing, softMed, core, conn26):
 
 
 def _final_carve(bone_mask, vol, softMed, conn26):
-    """Final boundary carve: remove weak perimeter voxels.
-
-    MATLAB reference: lines 259-264.
-    """
+    """Final boundary carve: remove weak perimeter voxels."""
     perim = _perimeter(bone_mask, conn26)
     band = ndimage.binary_dilation(perim, structure=ball(1))
 
