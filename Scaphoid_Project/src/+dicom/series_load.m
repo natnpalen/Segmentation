@@ -42,7 +42,7 @@ if isempty(Vraw)
 end
 % 3) Legacy fallback: enumerate files manually (rarely needed here)
 if isempty(Vraw)
- files = listDicomFiles_loose(folder);
+ files = listDicomFiles(folder);
  if isempty(files), error('No readable DICOM files found under: %s', folder); end
  [Vraw, infosCell] = tryDicomReadVolume(files, folder);
  if isempty(Vraw)
