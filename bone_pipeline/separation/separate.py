@@ -1,332 +1,474 @@
 """
-Bone separation module — adapted from the scaphoid pipeline's approach.
+Bone separation — faithful port of the scaphoid pipeline's segmentation
+strategy (+segment/run_segmentation.m).
 
-Pipeline (mirrors the proven scaphoid segmentation strategy):
-  1. Air detection: HU < -500 → identify non-air specimen region
-  2. Metal tag detection: HU > 1200 → mask tags with Gaussian falloff
-  3. Specimen isolation: non-air, morphologically closed, largest component
-  4. Bone seed finding: dense interior points within specimen
-  5. Morphological reconstruction: grow from seeds through allow region
-     where voxels are included if HU > low_threshold OR gradient is high
-  6. Interior protection: deep interior (>1mm) never removed
-  7. Connected components to separate individual bones
-  8. Tag-to-bone association by proximity
+Pipeline stages:
+  1. Specimen isolation (non-air, largest component)
+  2. Marker detection with Gaussian falloff artifact weighting
+  3. Adaptive constraint sweep: Loose/Medium/Strict (HU-offset, grad-percentile)
+     pairs each produce a candidate via morphological reconstruction through
+     OR-logic allow regions.  Candidates scored by 90th-percentile surface HU.
+  4. Morphological closing to bridge trabecular gaps
+  5. Boundary-band cling with deep-interior protection (>=1 mm always kept)
+  6. Edge-backed perimeter prune
+  7. Conservative boundary carve (multi-condition near air)
+  8. Final boundary carve
+  9. Connected components -> individual bones
+ 10. Tag-to-bone association by proximity
 """
 
 import numpy as np
 from pathlib import Path
 from scipy import ndimage
-from skimage.filters import threshold_otsu
-from skimage.measure import regionprops, label as sk_label
-from skimage.morphology import ball, binary_closing, binary_opening
-from skimage.segmentation import watershed
+from skimage.measure import regionprops
+from skimage.morphology import ball, binary_opening
 
 from .dicom_io import load_dicom_series
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
-                   closing_radius_mm=2.0, bone_hu_floor=0):
+                   closing_radius_mm=2.0):
     """Separate individual bones from a multi-bone DICOM CT scan.
 
-    Uses a multi-stage approach adapted from the scaphoid pipeline:
-    air detection → tag masking → specimen isolation → seed-based growth.
+    Uses the same multi-stage strategy as the scaphoid MATLAB pipeline:
+    adaptive constraint sweep with OR-logic allow regions, morphological
+    reconstruction from dense core seeds, boundary-band cling with deep-
+    interior protection, and multi-pass perimeter carving.
 
     Parameters
     ----------
     dicom_folder : str or Path
-        Path to folder containing DICOM files for one scan.
+        Folder containing DICOM files for one scan.
     tag_hu_min : float
         HU threshold for lead tag detection (default 1200).
     min_bone_volume_mm3 : float
-        Minimum volume for a component to be considered a bone.
+        Minimum volume for a component to count as a bone.
     closing_radius_mm : float
-        Morphological closing radius in mm for bridging trabecular gaps.
-    bone_hu_floor : float
-        Minimum HU for bone tissue. Voxels above this within the specimen
-        (and not tags) are candidates for bone. Default 0 (above water).
+        Morphological closing radius (mm) for bridging trabecular gaps.
 
     Returns
     -------
-    dict with keys:
-        'volume', 'spacing', 'bones' (list of bone dicts)
+    dict  with keys 'volume', 'spacing', 'bones' (list of bone dicts).
     """
     dicom_folder = Path(dicom_folder)
     volume, spacing = load_dicom_series(dicom_folder)
 
     if volume.ndim != 3:
-        raise ValueError(
-            f"Expected 3D volume, got shape {volume.shape}.")
+        raise ValueError(f"Expected 3-D volume, got shape {volume.shape}.")
 
-    voxel_vol_mm3 = float(np.prod(spacing))
-    mean_spacing = float(np.mean(spacing))
+    vol = volume.astype(np.float32)
+    voxel_vol = float(np.prod(spacing))
+    mean_sp = float(np.mean(spacing))
+    conn26 = np.ones((3, 3, 3), dtype=bool)
 
-    # --- Stage 1: Air detection & specimen isolation ---
-    print("  Stage 1: Air detection & specimen isolation...")
-    air_mask = volume < -500
-    non_air = ~air_mask
+    # === Stage 1: Specimen isolation ===
+    print("  Stage 1: Specimen isolation...")
+    specimen = _isolate_specimen(vol, spacing)
+    print(f"    Specimen: {np.sum(specimen) * voxel_vol:.0f} mm³")
 
-    close_r = max(1, int(round(1.0 / mean_spacing)))
-    non_air = ndimage.binary_closing(non_air, structure=ball(close_r))
+    # === Stage 2: Marker & artifact detection ===
+    print("  Stage 2: Marker & artifact detection...")
+    lead_mask = specimen & (vol > tag_hu_min)
+    marker_mask = lead_mask.copy()
+    if np.any(lead_mask):
+        near_lead = ndimage.binary_dilation(lead_mask, structure=ball(2))
+        flags = specimen & (vol >= 200) & (vol <= 700) & near_lead
+        marker_mask = marker_mask | flags
 
-    labeled_spec, n_spec = ndimage.label(non_air)
-    if n_spec > 0:
-        sizes = ndimage.sum(non_air, labeled_spec, range(1, n_spec + 1))
-        largest = int(np.argmax(sizes)) + 1
-        specimen_mask = labeled_spec == largest
+    if np.any(marker_mask):
+        d_mm = ndimage.distance_transform_edt(~marker_mask, sampling=spacing)
+        artifact_w = np.exp(-(d_mm / 3.0) ** 2)
     else:
-        specimen_mask = non_air
+        artifact_w = np.zeros_like(vol)
 
-    specimen_vol = np.sum(specimen_mask) * voxel_vol_mm3
-    print(f"    Specimen volume: {specimen_vol:.0f} mm³")
+    marker_dil = ndimage.binary_dilation(marker_mask, structure=ball(2))
 
-    # --- Stage 2: Metal tag detection ---
-    print("  Stage 2: Metal tag detection...")
-    tag_mask = specimen_mask & (volume > tag_hu_min)
+    tag_components = _find_tags(lead_mask, spacing, voxel_vol)
+    print(f"    Found {len(tag_components)} metal tags")
 
-    # Dilate tags slightly to capture immediate surroundings
-    tag_dilated = ndimage.binary_dilation(tag_mask, structure=ball(2))
+    # === Stage 3: Adaptive thresholds (anchored to softMed) ===
+    print("  Stage 3: Adaptive bone detection...")
 
-    # Build artifact weight map (Gaussian falloff from tags)
-    if np.any(tag_mask):
-        tag_dist = ndimage.distance_transform_edt(~tag_mask, sampling=spacing)
-        artifact_sigma_mm = 3.0
-        artifact_weight = np.exp(-(tag_dist / artifact_sigma_mm) ** 2)
-    else:
-        artifact_weight = np.zeros_like(volume, dtype=float)
+    non_bg = vol[specimen & (vol > -300)]
+    softMed = float(np.median(non_bg)) if len(non_bg) > 0 else -300.0
 
-    n_tags_found = 0
-    tag_components = []
-    if np.any(tag_mask):
-        tag_labeled, n_tags_found = ndimage.label(tag_mask)
-        tag_props = regionprops(tag_labeled)
-        for prop in tag_props:
-            tag_components.append({
-                'label': prop.label,
-                'centroid': np.array(prop.centroid) * np.array(spacing),
-                'mask': tag_labeled == prop.label,
-                'volume_mm3': prop.area * voxel_vol_mm3,
-            })
+    vals_mask = specimen & ~marker_dil & (vol > -300) & (vol < 2000)
+    vals = vol[vals_mask]
+    if len(vals) == 0:
+        vals = vol[specimen & (vol > -300)]
 
-    print(f"    Found {n_tags_found} metal tags")
+    G = _gradient_magnitude(vol, spacing)
 
-    # --- Stage 3: Bone detection with gradient-assisted growth ---
-    print("  Stage 3: Bone detection (seed-based growth)...")
+    core_thr = max(280, min(700, float(np.percentile(vals, 94))))
+    core = specimen & ~marker_dil & (vol > core_thr)
 
-    # Compute gradient magnitude for edge detection
-    grad = _compute_gradient_magnitude(volume, spacing)
+    if not np.any(core):
+        for p in [92, 90, 88, 86, 84]:
+            alt = max(220, min(650, float(np.percentile(vals, p))))
+            c_alt = specimen & ~marker_dil & (vol > alt)
+            if np.sum(c_alt) > 2000:
+                core, core_thr = c_alt, alt
+                print(f"    Core relaxed to p{p} (thr={alt:.0f})")
+                break
 
-    # Allow region: within specimen, above bone floor OR high gradient
-    # This is the key insight from the scaphoid pipeline — OR logic
-    # includes trabecular bone that has good boundary gradients
-    specimen_no_tags = specimen_mask & (~tag_dilated)
+    print(f"    softMed={softMed:.0f}, core_thr={core_thr:.0f}, "
+          f"core={np.sum(core) * voxel_vol:.0f} mm³")
 
-    grad_thresh = np.percentile(grad[specimen_no_tags], 85)
-    hu_allow = specimen_no_tags & (
-        (volume > bone_hu_floor) | (grad > grad_thresh)
-    )
+    # === Stage 4: Constraint sweep ===
+    constraints = [
+        ("Loose",  110, 85),
+        ("Medium", 135, 89),
+        ("Strict", 160, 92),
+    ]
 
-    allow_vol = np.sum(hu_allow) * voxel_vol_mm3
-    print(f"    Allow region (HU>{bone_hu_floor} OR grad>{grad_thresh:.1f}): "
-          f"{allow_vol:.0f} mm³")
+    best_mask = None
+    best_score = -np.inf
+    best_name = ""
 
-    # Find dense core seeds (high HU within specimen, away from tags)
-    core_hu_thresh = np.percentile(volume[specimen_no_tags], 90)
-    core_hu_thresh = max(200, min(700, core_hu_thresh))
-    core_seeds = specimen_no_tags & (volume > core_hu_thresh)
+    specimen_G = G[specimen]
 
-    # Remove small core fragments
-    core_seeds = _remove_small_components(core_seeds, 10)
+    for name, hu_off, g_pct in constraints:
+        hu_floor = max(70, min(220, softMed + hu_off))
+        g_thr = float(np.percentile(specimen_G, g_pct))
 
-    print(f"    Core seed threshold: {core_hu_thresh:.0f} HU, "
-          f"seed volume: {np.sum(core_seeds) * voxel_vol_mm3:.0f} mm³")
+        allow = specimen & ~marker_dil & (
+            (vol > hu_floor) | (G > g_thr))
 
-    # Morphological reconstruction: grow from core seeds through allow region
-    # This is equivalent to the scaphoid pipeline's imreconstruct
-    bone_mask = _morphological_reconstruct(core_seeds, hu_allow)
+        if np.any(core):
+            cand = _reconstruct(core, allow)
+        else:
+            cand = allow
 
-    # Morphological closing to bridge remaining trabecular gaps
-    close_r_bone = max(1, int(round(closing_radius_mm / mean_spacing)))
-    bone_mask = ndimage.binary_closing(bone_mask, structure=ball(close_r_bone))
+        cand = _remove_tiny(cand, 500)
+        score = _perimeter_score(cand, vol, conn26)
+
+        print(f"    {name}: hu_floor={hu_floor:.0f}, "
+              f"vol={np.sum(cand) * voxel_vol:.0f} mm³, "
+              f"perim90={score:.1f}")
+
+        if score > best_score:
+            best_score, best_mask, best_name = score, cand, name
+
+    print(f"    Winner: {best_name} (perim90={best_score:.1f})")
+    bone_mask = best_mask if best_mask is not None else np.zeros_like(
+        specimen, dtype=bool)
+
+    # Relaxed retry if surface looks too low
+    if best_score < 150 or not np.any(bone_mask):
+        print("    Low score — trying relaxed constraints...")
+        for name, hu_off, g_pct in [("RelaxA", 80, 80), ("RelaxB", 95, 83)]:
+            hu_floor = max(50, min(200, softMed + hu_off))
+            g_thr = float(np.percentile(specimen_G, g_pct))
+            allow = specimen & ~marker_dil & (
+                (vol > hu_floor) | (G > g_thr))
+            cand = _reconstruct(core, allow) if np.any(core) else allow
+            cand = _remove_tiny(cand, 500)
+            score = _perimeter_score(cand, vol, conn26)
+            if score > best_score or not np.any(bone_mask):
+                bone_mask, best_score = cand, score
+                print(f"    Relaxed winner: {name} (perim90={score:.1f})")
+
+    # Last-ditch fallback
+    if not np.any(bone_mask):
+        print("    Fallback: simple threshold grow...")
+        t_lo = max(130, min(240, softMed + 140))
+        allowed = specimen & (vol > t_lo) & ~marker_dil
+        seed_dil = ndimage.binary_dilation(core, structure=ball(1))
+        bone_mask = _reconstruct(seed_dil, allowed) if np.any(core) else allowed
+        bone_mask = _remove_tiny(bone_mask, 200)
+
+    # Morphological closing to bridge trabecular gaps
+    close_r = max(1, int(round(closing_radius_mm / mean_sp)))
+    bone_mask = ndimage.binary_closing(bone_mask, structure=ball(close_r))
+    bone_mask = ndimage.binary_fill_holes(bone_mask)
+    bone_mask = bone_mask & specimen
+
+    print(f"    After reconstruction + closing: "
+          f"{np.sum(bone_mask) * voxel_vol:.0f} mm³")
+
+    # === Stage 5: Boundary refinement (matching MATLAB) ===
+    print("  Stage 5: Boundary refinement...")
+
+    # 5a. Boundary-band cling with interior protection
+    bone_mask = _boundary_cling(bone_mask, vol, G, spacing, vals,
+                                softMed, conn26)
+
+    # 5b. Edge-backed perimeter prune
+    bone_mask = _edge_prune(bone_mask, vol, G, softMed, conn26)
+
+    # 5c. Conservative boundary carve
+    bone_mask = _boundary_carve(bone_mask, vol, G, spacing, softMed,
+                                core, conn26)
+
+    # 5d. Final boundary carve
+    bone_mask = _final_carve(bone_mask, vol, softMed, conn26)
+
+    # Final cleanup (no keep-largest — we want multiple bones)
+    bone_mask = binary_opening(bone_mask, ball(1))
+    bone_mask = ndimage.binary_closing(bone_mask, structure=ball(1))
     bone_mask = ndimage.binary_fill_holes(bone_mask)
 
-    # Keep only within specimen
-    bone_mask = bone_mask & specimen_mask
+    min_vox = max(200, int(min_bone_volume_mm3 / voxel_vol / 2))
+    bone_mask = _remove_tiny(bone_mask, min_vox)
 
-    bone_vol = np.sum(bone_mask) * voxel_vol_mm3
-    print(f"    Bone mask volume after reconstruction: {bone_vol:.0f} mm³")
-
-    # --- Stage 4: Interior protection & boundary refinement ---
-    print("  Stage 4: Interior protection & boundary carving...")
-
-    bone_mask = _refine_boundary(volume, bone_mask, grad, spacing,
-                                 artifact_weight)
-
-    final_vol = np.sum(bone_mask) * voxel_vol_mm3
+    final_vol = np.sum(bone_mask) * voxel_vol
     print(f"    Final bone volume: {final_vol:.0f} mm³")
 
-    # --- Stage 5: Separate individual bones ---
-    print("  Stage 5: Separating individual bones...")
-
-    labeled, n_components = ndimage.label(bone_mask)
+    # === Stage 6: Split into individual bones ===
+    print("  Stage 6: Splitting into individual bones...")
+    labeled, n_comp = ndimage.label(bone_mask)
     props = regionprops(labeled, intensity_image=volume)
 
     bones = []
-    small_count = 0
-
     for prop in props:
-        vol_mm3 = prop.area * voxel_vol_mm3
+        vol_mm3 = prop.area * voxel_vol
         mean_hu = float(prop.intensity_mean)
-
+        if mean_hu > tag_hu_min:
+            continue
         if vol_mm3 >= min_bone_volume_mm3:
             bones.append({
-                'label': prop.label,
-                'centroid': np.array(prop.centroid) * np.array(spacing),
-                'mask': labeled == prop.label,
-                'bbox': prop.bbox,
-                'volume_mm3': vol_mm3,
-                'mean_hu': mean_hu,
+                "label": prop.label,
+                "centroid": np.array(prop.centroid) * np.array(spacing),
+                "mask": labeled == prop.label,
+                "bbox": prop.bbox,
+                "volume_mm3": vol_mm3,
+                "mean_hu": mean_hu,
             })
-        else:
-            small_count += 1
 
-    if small_count > 0:
-        print(f"    Filtered {small_count} small components "
-              f"(< {min_bone_volume_mm3} mm³)")
-
-    # --- Stage 6: Tag-to-bone association ---
-    for bone in bones:
-        bone['tag_id'] = None
-        bone['tag_dist'] = None
-
-    if tag_components and bones:
-        bone_centroids = np.array([b['centroid'] for b in bones])
-        for tag in tag_components:
-            dists = np.linalg.norm(bone_centroids - tag['centroid'], axis=1)
-            nearest_idx = int(np.argmin(dists))
-            nearest_dist = float(dists[nearest_idx])
-
-            current = bones[nearest_idx].get('tag_dist')
-            if current is None or nearest_dist < current:
-                bones[nearest_idx]['tag_id'] = tag['label']
-                bones[nearest_idx]['tag_dist'] = nearest_dist
-
-    bones.sort(key=lambda b: b['volume_mm3'], reverse=True)
+    _associate_tags(bones, tag_components)
+    bones.sort(key=lambda b: b["volume_mm3"], reverse=True)
 
     print(f"\nFound {len(bones)} bones and {len(tag_components)} tags in scan")
-    for i, bone in enumerate(bones):
-        tag_str = f"tag {bone['tag_id']}" if bone['tag_id'] else "no tag"
-        print(f"  Bone {i+1}: {bone['volume_mm3']:.1f} mm³, "
-              f"mean HU {bone['mean_hu']:.0f}, {tag_str}")
+    for i, b in enumerate(bones):
+        tag = f"tag {b['tag_id']}" if b.get("tag_id") else "no tag"
+        print(f"  Bone {i + 1}: {b['volume_mm3']:.1f} mm³, "
+              f"mean HU {b['mean_hu']:.0f}, {tag}")
 
-    return {
-        'volume': volume,
-        'spacing': spacing,
-        'bones': bones,
-    }
+    return {"volume": volume, "spacing": spacing, "bones": bones}
 
 
-def _compute_gradient_magnitude(volume, spacing):
-    """Compute 3D gradient magnitude of the volume."""
-    gz = ndimage.sobel(volume, axis=0) / spacing[0]
-    gy = ndimage.sobel(volume, axis=1) / spacing[1]
-    gx = ndimage.sobel(volume, axis=2) / spacing[2]
-    return np.sqrt(gz**2 + gy**2 + gx**2)
+# ---------------------------------------------------------------------------
+# Helpers — specimen & markers
+# ---------------------------------------------------------------------------
+
+def _isolate_specimen(vol, spacing):
+    """Largest non-air connected component (matches MATLAB buildSpecimenCrop)."""
+    non_air = vol > -500
+    r = max(1, int(round(0.6 / np.mean(spacing))))
+    non_air = ndimage.binary_closing(non_air, structure=ball(r))
+    labeled, n = ndimage.label(non_air)
+    if n == 0:
+        return non_air
+    sizes = ndimage.sum(non_air, labeled, range(1, n + 1))
+    return labeled == (int(np.argmax(sizes)) + 1)
 
 
-def _morphological_reconstruct(seed, mask):
-    """Binary morphological reconstruction: grow seed within mask.
+def _find_tags(lead_mask, spacing, voxel_vol):
+    if not np.any(lead_mask):
+        return []
+    labeled, n = ndimage.label(lead_mask)
+    tags = []
+    for prop in regionprops(labeled):
+        tags.append({
+            "label": prop.label,
+            "centroid": np.array(prop.centroid) * np.array(spacing),
+            "volume_mm3": prop.area * voxel_vol,
+        })
+    return tags
 
-    Equivalent to MATLAB's imreconstruct for binary images.
-    Iteratively dilates the seed, intersecting with mask each step,
-    until convergence.
+
+def _associate_tags(bones, tags):
+    for b in bones:
+        b["tag_id"] = None
+        b["tag_dist"] = None
+    if not tags or not bones:
+        return
+    centroids = np.array([b["centroid"] for b in bones])
+    for tag in tags:
+        dists = np.linalg.norm(centroids - tag["centroid"], axis=1)
+        idx = int(np.argmin(dists))
+        d = float(dists[idx])
+        if bones[idx]["tag_dist"] is None or d < bones[idx]["tag_dist"]:
+            bones[idx]["tag_id"] = tag["label"]
+            bones[idx]["tag_dist"] = d
+
+
+# ---------------------------------------------------------------------------
+# Helpers — core operations
+# ---------------------------------------------------------------------------
+
+def _gradient_magnitude(vol, spacing):
+    """3-D gradient magnitude with anisotropic spacing correction."""
+    gz = ndimage.sobel(vol, axis=0) / spacing[0]
+    gy = ndimage.sobel(vol, axis=1) / spacing[1]
+    gx = ndimage.sobel(vol, axis=2) / spacing[2]
+    return np.sqrt(gz ** 2 + gy ** 2 + gx ** 2)
+
+
+def _reconstruct(seed, mask):
+    """Binary morphological reconstruction (imreconstruct equivalent).
+
+    Keeps all connected components of *mask* that contain at least one
+    *seed* voxel.  O(n) via connected-component labelling — orders of
+    magnitude faster than iterative dilation.
     """
-    result = seed & mask
-    selem = ball(1)
-
-    while True:
-        expanded = ndimage.binary_dilation(result, structure=selem) & mask
-        if np.array_equal(expanded, result):
-            break
-        result = expanded
-
-    return result
-
-
-def _refine_boundary(volume, bone_mask, grad, spacing, artifact_weight):
-    """Refine bone boundary: protect interior, carve weak edges.
-
-    Adapted from the scaphoid pipeline's multi-stage boundary refinement:
-    - Deep interior (>1mm from surface) is always protected
-    - Surface voxels removed only if BOTH low-HU AND low-gradient
-    """
-    mean_spacing = float(np.mean(spacing))
-
-    # Distance from bone surface into interior
-    dist_interior = ndimage.distance_transform_edt(bone_mask, sampling=spacing)
-    deep_interior = dist_interior >= 1.0  # mm
-
-    # Boundary band: 0-1mm from surface
-    boundary_band = bone_mask & (~deep_interior)
-
-    if not np.any(boundary_band):
-        return bone_mask
-
-    # Compute thresholds from boundary band statistics
-    band_hu = volume[boundary_band]
-    if len(band_hu) == 0:
-        return bone_mask
-
-    hu_carve_floor = max(100, float(np.percentile(band_hu, 15)))
-    grad_carve_floor = float(np.percentile(grad[boundary_band], 25))
-
-    # Remove boundary voxels that are BOTH low-HU AND low-gradient
-    # AND near air (within 1 voxel of HU < -300)
-    air_nearby = ndimage.binary_dilation(
-        volume < -300, structure=ball(1))
-
-    remove = (boundary_band &
-              (volume < hu_carve_floor) &
-              (grad < grad_carve_floor) &
-              air_nearby)
-
-    # Don't remove voxels near artifacts (could be metal-corrupted, not real air)
-    if np.any(artifact_weight > 0.1):
-        remove = remove & (artifact_weight < 0.1)
-
-    if np.any(remove):
-        bone_mask = bone_mask.copy()
-        bone_mask[remove] = False
-
-        # Restore deep interior (never touch it)
-        bone_mask = bone_mask | deep_interior
-
-        # Keep largest component
-        bone_mask = _keep_largest_component(bone_mask)
-
-        # Fill holes that may have been created
-        bone_mask = ndimage.binary_fill_holes(bone_mask)
-
-    return bone_mask
-
-
-def _keep_largest_component(mask):
-    """Keep only the largest connected component."""
     labeled, n = ndimage.label(mask)
-    if n <= 1:
-        return mask
-    sizes = ndimage.sum(mask, labeled, range(1, n + 1))
-    largest = int(np.argmax(sizes)) + 1
-    return labeled == largest
+    if n == 0:
+        return np.zeros_like(mask, dtype=bool)
+    seed_labels = set(np.unique(labeled[seed & mask]).tolist()) - {0}
+    if not seed_labels:
+        return np.zeros_like(mask, dtype=bool)
+    return np.isin(labeled, list(seed_labels))
 
 
-def _remove_small_components(mask, min_voxels):
-    """Remove connected components smaller than min_voxels."""
+def _perimeter(mask, conn26):
+    """Foreground voxels with at least one background 26-neighbour."""
+    return mask & ~ndimage.binary_erosion(mask, structure=conn26)
+
+
+def _perimeter_score(mask, vol, conn26):
+    """90th-percentile HU on the perimeter (MATLAB scoring criterion)."""
+    if not np.any(mask):
+        return -np.inf
+    perim = _perimeter(mask, conn26)
+    if not np.any(perim):
+        return -np.inf
+    return float(np.percentile(vol[perim], 90))
+
+
+def _remove_tiny(mask, min_voxels):
+    """Remove connected components smaller than *min_voxels*."""
     labeled, n = ndimage.label(mask)
     if n == 0:
         return mask
-    result = mask.copy()
-    for i in range(1, n + 1):
-        component = labeled == i
-        if np.sum(component) < min_voxels:
-            result[component] = False
+    sizes = ndimage.sum(mask, labeled, range(1, n + 1))
+    keep = np.zeros(n + 1, dtype=bool)
+    for i in range(n):
+        if sizes[i] >= min_voxels:
+            keep[i + 1] = True
+    return keep[labeled]
+
+
+# ---------------------------------------------------------------------------
+# Helpers — boundary refinement (faithful to MATLAB lines 207-264)
+# ---------------------------------------------------------------------------
+
+def _boundary_cling(bone_mask, vol, G, spacing, vals, softMed, conn26):
+    """Boundary-band cling with deep-interior protection.
+
+    Deep interior (>=1 mm from surface) is unconditionally preserved.
+    The surface band (0-1 mm) is replaced with only the voxels that are
+    connected to dense surface seeds through an OR-logic support region.
+
+    MATLAB reference: +segment/run_segmentation.m lines 207-224.
+    """
+    D_in = ndimage.distance_transform_edt(bone_mask, sampling=spacing)
+    deep = D_in >= 1.0
+    band = bone_mask & ~deep
+
+    if not np.any(band):
+        return bone_mask
+
+    core_thr = max(240, min(650, float(np.percentile(vals, 92))))
+    core_seed = band & (vol > core_thr)
+
+    hu_support = max(60, min(180, softMed + 90))
+    g_thr = float(np.percentile(G, 80))
+    support = band & ((vol > hu_support) | (G > g_thr))
+
+    if np.any(core_seed) and np.any(support):
+        cling = _reconstruct(core_seed, support)
+    elif np.any(support):
+        cling = support
+    else:
+        cling = band
+
+    result = deep | cling
+    result = _remove_tiny(result, 200)
+    result = ndimage.binary_closing(result, structure=ball(1))
+    result = ndimage.binary_fill_holes(result)
+    return result
+
+
+def _edge_prune(bone_mask, vol, G, softMed, conn26):
+    """Edge-backed perimeter prune.
+
+    Remove surface-band voxels that are BOTH low-HU AND low-gradient.
+
+    MATLAB reference: lines 226-236.
+    """
+    perim = _perimeter(bone_mask, conn26)
+    band1 = ndimage.binary_dilation(perim, structure=ball(1))
+
+    T_hu = max(160, min(340, softMed + 190))
+    T_g = float(np.percentile(G, 70))
+
+    kill = band1 & (vol < T_hu) & (G < T_g)
+    if not np.any(kill):
+        return bone_mask
+
+    result = bone_mask.copy()
+    result[kill] = False
+    result = _remove_tiny(result, 200)
+    result = ndimage.binary_closing(result, structure=ball(1))
+    result = ndimage.binary_fill_holes(result)
+    return result
+
+
+def _boundary_carve(bone_mask, vol, G, spacing, softMed, core, conn26):
+    """Conservative boundary carve near air.
+
+    Remove perimeter-band voxels that are low-HU, near air, and not
+    protected by dense core.
+
+    MATLAB reference: lines 239-256.
+    """
+    perim = _perimeter(bone_mask, conn26)
+    band1 = ndimage.binary_dilation(perim, structure=ball(1))
+    outer1 = ndimage.binary_dilation(bone_mask, structure=ball(1)) & ~bone_mask
+
+    protected = (ndimage.binary_dilation(core, structure=ball(2))
+                 if np.any(core) else np.zeros_like(bone_mask))
+
+    T_hi = max(170, min(360, softMed + 210))
+    T_lo = T_hi - 80
+
+    air_near = outer1 & ndimage.binary_dilation(vol < -300, structure=ball(1))
+
+    kill = (band1
+            & (vol < T_lo)
+            & ndimage.binary_dilation(air_near, structure=ball(1))
+            & ~protected)
+
+    if not np.any(kill):
+        return bone_mask
+
+    result = bone_mask.copy()
+    result[kill] = False
+    result = _remove_tiny(result, 200)
+    result = ndimage.binary_closing(result, structure=ball(1))
+    result = ndimage.binary_fill_holes(result)
+    return result
+
+
+def _final_carve(bone_mask, vol, softMed, conn26):
+    """Final boundary carve: remove weak perimeter voxels.
+
+    MATLAB reference: lines 259-264.
+    """
+    perim = _perimeter(bone_mask, conn26)
+    band = ndimage.binary_dilation(perim, structure=ball(1))
+
+    hu_floor = max(180, min(400, softMed + 220))
+    kill = band & (vol < hu_floor)
+
+    if not np.any(kill):
+        return bone_mask
+
+    result = bone_mask.copy()
+    result[kill] = False
     return result
