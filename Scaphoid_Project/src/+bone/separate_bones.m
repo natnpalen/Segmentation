@@ -3,129 +3,128 @@ function result = separate_bones(ds, opts)
 %
 %   result = bone.separate_bones(ds, opts)
 %
-% For excised specimens scanned in air, bones are separated by air gaps.
-% Strategy:
-%   1. Find non-air voxels with minimal closing (preserve natural gaps)
-%   2. Remove lead cores (HU>1200) before component analysis
-%   3. Connected components → each is either a bone or tag collar
-%   4. Classify by HU distribution and volume
-%   5. Per-bone refinement using scaphoid pipeline's protected-core approach
+% Markers are large structured radiographic assemblies (metal letter + tabs
+% + housing block, up to ~2000 mm^3).  Strategy:
+%   1. Detect marker assemblies: metal (HU>1200) + surrounding fixture
+%   2. Build exclusion zone: metal + physical 2mm buffer to capture housing
+%   3. Find bone components in non-air minus exclusion zone (no closing)
+%   4. Classify: bones vs residual fixture fragments
+%   5. Per-bone refinement with hole filling
 
 vol = double(ds.HU);
 spacing = ds.spacing;
 voxel_vol = prod(spacing);
 
-% ---- Stage 1: Marker detection ----
-fprintf('  [Separate] Stage 1: Marker detection...\n');
-lead_core = vol > opts.TagHUMin;
+% ---- Stage 1: Marker assembly detection ----
+fprintf('  [Separate] Stage 1: Marker assembly detection...\n');
+metal = vol > opts.TagHUMin;
 [marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.MarkerRangeHU, ...
     opts.ArtifactSigmaMM, spacing);
 
-n_lead = sum(lead_core(:));
-n_marker = sum(marker_mask(:));
-fprintf('    Lead core voxels: %d (%.1f mm^3)\n', n_lead, n_lead*voxel_vol);
-fprintf('    Marker mask voxels: %d (%.1f mm^3)\n', n_marker, n_marker*voxel_vol);
+% Marker assembly = metal + collar (HU 200-700 near metal)
+% + physical 2mm buffer to capture non-metallic fixture/housing
+assembly_excl = physical_dilate(metal, 2.0, spacing);
 
-% Count real tags (lead clusters > 2 mm^3)
-CC_tags = bwconncomp(lead_core, 26);
+n_metal = sum(metal(:));
+n_excl = sum(assembly_excl(:));
+fprintf('    Metal voxels (HU>%d): %d (%.1f mm^3)\n', opts.TagHUMin, n_metal, n_metal*voxel_vol);
+fprintf('    Assembly exclusion (metal + 2mm): %d voxels (%.1f mm^3)\n', n_excl, n_excl*voxel_vol);
+
+% Identify individual marker assemblies (connected components of metal)
+CC_metal = bwconncomp(metal, 26);
 min_tag_vox = max(5, round(2.0 / voxel_vol));
 real_tags = {};
-for i = 1:CC_tags.NumObjects
-    if numel(CC_tags.PixelIdxList{i}) >= min_tag_vox
-        [rr, cc, ss] = ind2sub(size(vol), CC_tags.PixelIdxList{i});
+for i = 1:CC_metal.NumObjects
+    if numel(CC_metal.PixelIdxList{i}) >= min_tag_vox
+        [rr, cc, ss] = ind2sub(size(vol), CC_metal.PixelIdxList{i});
         tag = struct();
         tag.label = numel(real_tags) + 1;
         tag.centroid_mm = [mean(rr) mean(cc) mean(ss)] .* spacing;
-        tag.volume_mm3 = numel(CC_tags.PixelIdxList{i}) * voxel_vol;
+        tag.volume_mm3 = numel(CC_metal.PixelIdxList{i}) * voxel_vol;
         real_tags{end+1} = tag; %#ok<AGROW>
     end
 end
-fprintf('    Real tags: %d (each > %.0f mm^3)\n', numel(real_tags), 2.0);
+fprintf('    Marker assemblies: %d\n', numel(real_tags));
 for t = 1:numel(real_tags)
-    fprintf('      Tag %d: %.1f mm^3 at [%.1f %.1f %.1f] mm\n', ...
+    fprintf('      Marker %d: %.1f mm^3 metal at [%.1f %.1f %.1f] mm\n', ...
         t, real_tags{t}.volume_mm3, real_tags{t}.centroid_mm);
 end
 
-% ---- Stage 2: Find objects (bones + tag collars) ----
-fprintf('  [Separate] Stage 2: Finding objects...\n');
+% ---- Stage 2: Find bone candidates ----
+fprintf('  [Separate] Stage 2: Finding bone candidates...\n');
 
-% Non-air mask with small closing (1mm) to fill surface porosity only
+% Non-air WITHOUT closing (bones are solid objects separated by air,
+% closing merges nearby markers with bones)
 non_air = vol > -500;
-non_air = physical_close(non_air, 1.0, spacing);
 fprintf('    Non-air voxels: %d (%.0f mm^3)\n', sum(non_air(:)), sum(non_air(:))*voxel_vol);
 
-% Remove lead cores BEFORE connectivity analysis — this prevents
-% tags from bridging to nearby bones through the lead material
-non_air_no_lead = non_air & ~imdilate(lead_core, strel('sphere', 1));
-fprintf('    After removing lead+1vox buffer: %d voxels (%.0f mm^3)\n', ...
-    sum(non_air_no_lead(:)), sum(non_air_no_lead(:))*voxel_vol);
+% Subtract marker exclusion zone
+bone_candidates = non_air & ~assembly_excl;
+fprintf('    After marker exclusion: %d voxels (%.0f mm^3)\n', ...
+    sum(bone_candidates(:)), sum(bone_candidates(:))*voxel_vol);
 
-% Connected components — each is naturally a bone or tag collar
-CC = bwconncomp(non_air_no_lead, 26);
-fprintf('    Connected components: %d\n', CC.NumObjects);
-
-% Sort by volume for logging
+% Connected components
+CC = bwconncomp(bone_candidates, 26);
 comp_vols = cellfun(@numel, CC.PixelIdxList) * voxel_vol;
 [~, vol_order] = sort(comp_vols, 'descend');
+fprintf('    Connected components: %d (largest: %.0f mm^3)\n', ...
+    CC.NumObjects, max(comp_vols));
 
-% ---- Stage 3: Classify components ----
-fprintf('  [Separate] Stage 3: Classifying components...\n');
+% ---- Stage 3: Classify and refine ----
+fprintf('  [Separate] Stage 3: Classifying and refining...\n');
 bones = {};
 small_count = 0;
-tag_collar_count = 0;
+fixture_count = 0;
+
+% Build metal distance map for fixture detection
+d_metal_mm = bwdist(metal) .* mean(spacing);
 
 for ii = 1:CC.NumObjects
     i = vol_order(ii);
     comp = false(size(vol));
     comp(CC.PixelIdxList{i}) = true;
-    comp_vol = sum(comp(:)) * voxel_vol;
+    comp_vol = comp_vols(i);
 
-    % Skip tiny components
     if comp_vol < opts.MinBoneVolMM3
         small_count = small_count + 1;
         continue;
     end
 
-    % HU statistics of this component
+    % HU statistics
     hu_vals = vol(comp);
     n_vox = numel(hu_vals);
     mean_hu_all = mean(hu_vals);
-    hu_bone_vals = hu_vals(hu_vals > -200);
-    if ~isempty(hu_bone_vals)
-        mean_hu_bone = mean(hu_bone_vals);
+
+    % Bone-tissue HU (excluding air trapped inside)
+    tissue_vals = hu_vals(hu_vals > -200);
+    if ~isempty(tissue_vals)
+        mean_hu_tissue = mean(tissue_vals);
+        tissue_frac = numel(tissue_vals) / n_vox;
     else
-        mean_hu_bone = mean_hu_all;
+        mean_hu_tissue = mean_hu_all;
+        tissue_frac = 0;
     end
-
-    % Fraction of voxels near lead (within 3 voxels of lead core)
-    lead_dilated_3 = imdilate(lead_core, strel('sphere', 3));
-    near_lead_frac = sum(comp(:) & lead_dilated_3(:)) / n_vox;
-
-    % Fraction of voxels in marker HU range (200-700)
-    in_marker_range = sum(hu_vals >= opts.MarkerRangeHU(1) & hu_vals <= opts.MarkerRangeHU(2)) / n_vox;
-
-    % Fraction very bright (> 800 HU, tag/artifact material)
-    bright_frac = sum(hu_vals > 800) / n_vox;
 
     % Dense bone fraction (> 200 HU)
     dense_frac = sum(hu_vals > 200) / n_vox;
 
-    fprintf('    Component %d: %.0f mm^3, mean HU %.0f (bone-only %.0f)\n', ...
-        i, comp_vol, mean_hu_all, mean_hu_bone);
-    fprintf('      near_lead=%.0f%%, marker_range=%.0f%%, bright=%.0f%%, dense=%.0f%%\n', ...
-        near_lead_frac*100, in_marker_range*100, bright_frac*100, dense_frac*100);
+    % Distance to nearest metal: check if this component is a fixture fragment
+    % sitting right at the edge of the exclusion zone
+    comp_dists = d_metal_mm(comp);
+    median_metal_dist = median(comp_dists);
+    min_metal_dist = min(comp_dists);
 
-    % Classification: tag collar if mostly near lead AND mostly in marker HU range
-    if near_lead_frac > 0.5 && in_marker_range > 0.3
-        fprintf('      -> TAG COLLAR (near lead + marker HU range)\n');
-        tag_collar_count = tag_collar_count + 1;
-        continue;
-    end
+    fprintf('    Component %d: %.0f mm^3, mean HU %.0f (tissue %.0f)\n', ...
+        i, comp_vol, mean_hu_all, mean_hu_tissue);
+    fprintf('      tissue=%.0f%%, dense=%.0f%%, dist_to_metal=[%.1f, med %.1f] mm\n', ...
+        tissue_frac*100, dense_frac*100, min_metal_dist, median_metal_dist);
 
-    % Also reject if very bright (likely tag fragment that survived lead removal)
-    if bright_frac > 0.30
-        fprintf('      -> TAG FRAGMENT (%.0f%% > 800 HU)\n', bright_frac*100);
-        tag_collar_count = tag_collar_count + 1;
+    % Fixture fragment detection:
+    % Residual fixture housing sits right at the edge of the 2mm exclusion zone.
+    % It has: small volume, very close to metal, low tissue fraction
+    if comp_vol < 1500 && median_metal_dist < 4.0 && tissue_frac < 0.6
+        fprintf('      -> FIXTURE FRAGMENT (small, near metal, low tissue)\n');
+        fixture_count = fixture_count + 1;
         continue;
     end
 
@@ -138,9 +137,10 @@ for ii = 1:CC.NumObjects
     fprintf('      -> BONE CANDIDATE\n');
 
     % ---- Per-bone refinement ----
-    % Small closing to seal surface pores
-    refined = physical_close(comp, 1.0, spacing);
-    refined = refined & non_air;
+    refined = comp;
+
+    % Small closing (0.5mm) to seal surface porosity only
+    refined = physical_close(refined, 0.5, spacing);
 
     % Per-slice 2D fill to capture enclosed marrow cavities
     for z = 1:size(refined, 3)
@@ -151,19 +151,21 @@ for ii = 1:CC.NumObjects
     end
     refined = imfill(refined, 'holes');
 
-    % Scaphoid-style marker cleanup: remove marker voxels at boundary,
-    % protect interior (imerode + restore core)
-    core = imerode(refined, strel('sphere', 1));
-    marker_near = imdilate(marker_mask, strel('sphere', 1));
-    refined = (refined & ~marker_near) | core;
+    % Clip to stay outside marker exclusion zone
+    refined = refined & ~assembly_excl;
+
+    % Remove any HU > 1200 voxels (residual metal/artifact in bone)
+    refined = refined & (vol <= opts.TagHUMin);
 
     % Keep only the largest connected piece
     CC_ref = bwconncomp(refined, 26);
     if CC_ref.NumObjects > 1
-        comp_sizes = cellfun(@numel, CC_ref.PixelIdxList);
-        [~, largest] = max(comp_sizes);
+        ref_sizes = cellfun(@numel, CC_ref.PixelIdxList);
+        [~, largest] = max(ref_sizes);
         refined = false(size(vol));
         refined(CC_ref.PixelIdxList{largest}) = true;
+        fprintf('      Kept largest of %d fragments (dropped %.0f mm^3)\n', ...
+            CC_ref.NumObjects, (sum(ref_sizes) - ref_sizes(largest))*voxel_vol);
     end
 
     refined_vol = sum(refined(:)) * voxel_vol;
@@ -172,7 +174,7 @@ for ii = 1:CC.NumObjects
         continue;
     end
 
-    % HU of refined bone (bone-tissue voxels only)
+    % HU of refined bone (tissue voxels only)
     bone_vals = vol(refined & (vol > -200));
     if ~isempty(bone_vals)
         refined_hu = mean(bone_vals);
@@ -204,8 +206,8 @@ for ii = 1:CC.NumObjects
         comp_vol, refined_vol, refined_hu);
 end
 
-fprintf('    Filtered: %d small (< %.0f mm^3), %d tag collars/fragments\n', ...
-    small_count, opts.MinBoneVolMM3, tag_collar_count);
+fprintf('    Filtered: %d small (< %.0f mm^3), %d fixture fragments\n', ...
+    small_count, opts.MinBoneVolMM3, fixture_count);
 
 % ---- Stage 4: Tag association ----
 fprintf('  [Separate] Stage 4: Tag association...\n');
@@ -216,19 +218,19 @@ vols = cellfun(@(b) b.volume_mm3, bones);
 [~, order] = sort(vols, 'descend');
 bones = bones(order);
 
-fprintf('\n  Found %d bones and %d tags in scan\n', numel(bones), numel(real_tags));
+fprintf('\n  Found %d bones and %d markers in scan\n', numel(bones), numel(real_tags));
 for i = 1:numel(bones)
     b = bones{i};
     if ~isempty(b.tag_id)
-        tag_str = sprintf('tag %d (%.1f mm away)', b.tag_id, b.tag_dist);
+        tag_str = sprintf('marker %d (%.1f mm away)', b.tag_id, b.tag_dist);
     else
-        tag_str = 'no tag';
+        tag_str = 'no marker';
     end
     fprintf('    Bone %d: %.1f mm^3, mean HU %.0f, centroid [%.1f %.1f %.1f] mm, %s\n', ...
         i, b.volume_mm3, b.mean_hu, b.centroid_mm, tag_str);
 end
 
-% Build specimen mask (union of all bones, for visualization)
+% Build specimen mask (union of all bones)
 specimen = false(size(vol));
 for i = 1:numel(bones)
     specimen = specimen | bones{i}.mask;
@@ -244,6 +246,17 @@ end
 
 
 % =========================================================================
+function dilated = physical_dilate(mask, radius_mm, spacing)
+    radius_vox = ceil(radius_mm ./ spacing);
+    [Y, X, Z] = ndgrid(-radius_vox(1):radius_vox(1), ...
+                        -radius_vox(2):radius_vox(2), ...
+                        -radius_vox(3):radius_vox(3));
+    dist_mm_sq = (Y*spacing(1)).^2 + (X*spacing(2)).^2 + (Z*spacing(3)).^2;
+    se = strel(dist_mm_sq <= radius_mm^2);
+    dilated = imdilate(mask, se);
+end
+
+
 function closed = physical_close(mask, radius_mm, spacing)
     radius_vox = ceil(radius_mm ./ spacing);
     [Y, X, Z] = ndgrid(-radius_vox(1):radius_vox(1), ...
@@ -278,7 +291,7 @@ function bones = associate_tags(bones, tags)
     for t = 1:numel(tags)
         dists = vecnorm(centroids - tags{t}.centroid_mm, 2, 2);
         [d, idx] = min(dists);
-        fprintf('      Tag %d -> Bone %d: %.1f mm\n', t, idx, d);
+        fprintf('      Marker %d -> Bone %d: %.1f mm\n', t, idx, d);
         if isempty(bones{idx}.tag_id) || d < bones{idx}.tag_dist
             bones{idx}.tag_id = tags{t}.label;
             bones{idx}.tag_dist = d;
