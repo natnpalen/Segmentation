@@ -84,12 +84,14 @@ for i = 1:CC.NumObjects
         continue;
     end
 
-    % Mean HU must be plausible for bone (not air/noise)
+    % Compute mean HU of bone-like voxels only (> -300 HU) to avoid
+    % penalizing components that grabbed excess air around the bone
+    bone_voxels = vol(comp) > -300;
     mean_hu_raw = mean(vol(comp));
-    if mean_hu_raw < -100
-        fprintf('    Component %d: %.0f mm^3 — skipped (mean HU %.0f, not bone)\n', ...
-            i, comp_vol, mean_hu_raw);
-        continue;
+    if any(bone_voxels)
+        mean_hu_bone = mean(vol(comp & (vol > -300)));
+    else
+        mean_hu_bone = mean_hu_raw;
     end
 
     % Reject if significant fraction is very bright (likely tag material)
@@ -115,7 +117,12 @@ for i = 1:CC.NumObjects
     filled = filled & specimen & ~marker_excl;
 
     filled_vol = sum(filled(:)) * voxel_vol;
-    filled_hu = mean(vol(filled));
+    bone_vals = vol(filled & (vol > -300));
+    if ~isempty(bone_vals)
+        filled_hu = mean(bone_vals);
+    else
+        filled_hu = mean(vol(filled));
+    end
 
     % Centroid in mm
     [rr, cc, ss] = ind2sub(size(filled), find(filled));
