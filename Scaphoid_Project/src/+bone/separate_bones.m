@@ -32,8 +32,9 @@ fprintf('    Metal (HU>%d): %d voxels (%.0f mm^3)\n', opts.TagHUMin, sum(metal(:
 fprintf('    Lead metal (HU>4000): %d voxels\n', nnz(lead_metal));
 fprintf('    Artifact sigma: %.1f mm\n', opts.ArtifactSigmaMM);
 
-% Identify individual marker assemblies
-CC_metal = bwconncomp(metal, 26);
+% Identify individual marker assemblies from actual lead (HU>3000),
+% not the opts.TagHUMin threshold which is too low for assembly detection
+CC_metal = bwconncomp(vol > 3000, 26);
 min_tag_vox = max(5, round(2.0 / voxel_vol));
 real_tags = {};
 for i = 1:CC_metal.NumObjects
@@ -167,28 +168,34 @@ for si = 1:numel(seeds)
     % Hard-remove lead metal from bone mask
     mask_bone_L = mask_bone_L & ~lead_L;
 
-    % Post-processing (marker carve + boundary refine)
-    vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
-    if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
-    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
-    core_L = vol_L > core_thr_L;
-    mask_bone_L = postprocess_bone(mask_bone_L, mk_L, lead_L, vol_L, G_L, softMed, core_L, spacing);
+    % Shell sealing FIRST (close gaps + fill interior), then remove markers.
+    % Order matters: if we remove markers first, imclose re-bridges to them.
+    mask_bone_L = seal_outer_shell(mask_bone_L, spacing);
 
     if ~any(mask_bone_L(:))
-        fprintf('      -> empty after post-processing, skipped\n');
+        fprintf('      -> empty after shell sealing, skipped\n');
         continue;
     end
 
-    % Shell sealing (ensures closed surface — ported from scaphoid sealOuterShell)
-    mask_bone_L = seal_outer_shell(mask_bone_L, spacing);
+    % NOW remove all marker material (lead + dense + light flags)
+    mask_bone_L = mask_bone_L & ~mk_L;
+    mask_bone_L = mask_bone_L & ~lead_L;
+
+    % Fill any holes left by marker removal, keep largest
+    mask_bone_L = imfill(mask_bone_L, 'holes');
+    mask_bone_L = keep_largest_3d(mask_bone_L);
+
+    if ~any(mask_bone_L(:))
+        fprintf('      -> empty after marker removal, skipped\n');
+        continue;
+    end
+
+    fprintf('      After seal+carve: %d voxels (%.0f mm^3)\n', ...
+        nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Paste back to full volume
     mask_bone = false(sz);
     mask_bone(r1:r2, c1:c2, s1:s2) = mask_bone_L;
-
-    % Remove definite marker material (lead+dense flags, NOT light flags
-    % which overlap with real bone tissue at 200-700 HU)
-    mask_bone = mask_bone & ~marker_core;
 
     bone_vol = sum(mask_bone(:)) * voxel_vol;
     if bone_vol < opts.MinBoneVolMM3
@@ -475,38 +482,6 @@ function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
 end
 
 
-% =========================================================================
-%  POST-PROCESSING (scaphoid approach: marker carve + boundary refinement)
-% =========================================================================
-function mask = postprocess_bone(mask, marker_mask, lead_metal, vol, ~, ~, ~, spacing)
-    if ~any(mask(:)), return; end
-
-    pre_vox = nnz(mask);
-
-    % Hard-remove lead metal (HU>4000)
-    mask = mask & ~lead_metal;
-
-    % Remove marker material from the bone surface but protect deep interior
-    interior = imerode(mask, strel('sphere', 2));
-    interior = interior & ~lead_metal;
-    mask = (mask & ~marker_mask) | interior;
-
-    % Fill holes and remove tiny fragments
-    mask = imfill(mask, 'holes');
-    mask = bwareaopen(mask, 500);
-    mask = keep_largest_3d(mask);
-    if ~any(mask(:)), return; end
-
-    % Close small gaps left by marker removal
-    mask = imclose(mask, strel('sphere', 2));
-    mask = imfill(mask, 'holes');
-    mask = keep_largest_3d(mask);
-
-    post_vox = nnz(mask);
-    fprintf('      Post-process: %d -> %d voxels (%.0f%% retained)\n', ...
-        pre_vox, post_vox, 100*post_vox/max(1, pre_vox));
-end
-
 
 % =========================================================================
 %  SPECIMEN MASK (largest non-air component)
@@ -669,7 +644,9 @@ end
 function BW = seal_outer_shell(BW, spacing)
     if ~any(BW(:)), return; end
 
-    rClose = max(1, round(1.5 / max(mean(spacing), eps)));
+    % Cap at 3 voxels — at 0.25mm spacing the mm-based formula gives 6,
+    % which bridges bone to nearby markers and grabs non-bone tissue
+    rClose = min(3, max(1, round(1.5 / max(mean(spacing), eps))));
     SE = strel('sphere', rClose);
     BW = imclose(BW, SE);
     BW = imfill(BW, 'holes');
