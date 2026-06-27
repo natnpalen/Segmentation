@@ -155,7 +155,7 @@ if small_count > 0
 end
 
 % ---- Stage 5: Tag association ----
-associate_tags(bones, real_tags);
+bones = associate_tags(bones, real_tags);
 
 % Sort by volume (largest first)
 vols = cellfun(@(b) b.volume_mm3, bones);
@@ -228,7 +228,7 @@ function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, marker_range, 
 end
 
 
-function associate_tags(bones, tags)
+function bones = associate_tags(bones, tags)
     if isempty(tags) || isempty(bones), return; end
     centroids = zeros(numel(bones), 3);
     for i = 1:numel(bones)

@@ -26,8 +26,9 @@ voxel_vol = prod(spacing);
 % ---- Distance from bone surface (in mm) ----
 D_mm = bwdist(~bone_mask) .* mean(spacing);
 
-% ---- In-bone HU values ----
-hu_bone = vol(bone_mask);
+% ---- In-bone HU values (exclude air voxels for threshold computation) ----
+bone_tissue_mask = bone_mask & (vol > -200);
+hu_bone = vol(bone_tissue_mask);
 
 % ---- Adaptive threshold via Otsu ----
 hu_min = min(hu_bone);
@@ -47,14 +48,14 @@ otsu_level = graythresh(hu_norm);
 otsu_hu = otsu_level * (hu_max - hu_min) + hu_min;
 
 % ---- Estimate cortical thickness from density-vs-depth profile ----
-max_depth = max(D_mm(bone_mask));
+max_depth = max(D_mm(bone_tissue_mask));
 n_bins = max(10, round(max_depth / 0.1));
 depth_edges = linspace(0, max_depth, n_bins + 1);
 depth_centers = (depth_edges(1:end-1) + depth_edges(2:end)) / 2;
 
 mean_hu_by_depth = zeros(n_bins, 1);
 for b = 1:n_bins
-    in_bin = bone_mask & (D_mm >= depth_edges(b)) & (D_mm < depth_edges(b+1));
+    in_bin = bone_tissue_mask & (D_mm >= depth_edges(b)) & (D_mm < depth_edges(b+1));
     if any(in_bin(:))
         mean_hu_by_depth(b) = mean(vol(in_bin));
     else
