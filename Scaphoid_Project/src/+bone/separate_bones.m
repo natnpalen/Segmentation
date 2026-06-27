@@ -569,9 +569,10 @@ function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, s
     % Lead letter cores: HU > 1200 (typically 4000-7000 HU)
     lead = HU > 1200;
 
-    % Dense flags/tabs: 700-1200 HU within 5 voxels of lead
-    % Flags can be ~1mm from the letter; at 0.25mm spacing that's 4 voxels
-    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 5));
+    % Dense flags/tabs: 700-1200 HU within 3 voxels of lead
+    % Keep radius small — cortical bone is also 700-1200 HU and sits
+    % right next to markers, so larger radii grab real bone surface.
+    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 3));
 
     % Light flags/housing: 200-700 HU within 2 voxels of lead+dense only
     % Keep radius small — this HU range overlaps real bone tissue

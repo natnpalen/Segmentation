@@ -209,6 +209,40 @@ if opts.SaveOutputs
         warning('Save STL failed: %s', ME.message);
     end
 
+    % Text summary file
+    try
+        summary_file = fullfile(outDir, 'pipeline_summary.txt');
+        fid = fopen(summary_file, 'w');
+        fprintf(fid, 'BONE SEGMENTATION PIPELINE SUMMARY\n');
+        fprintf(fid, '===================================\n');
+        fprintf(fid, 'Date: %s\n', datestr(now));
+        fprintf(fid, 'DICOM: %s\n', dicomFolder);
+        fprintf(fid, 'Volume: %dx%dx%d, spacing [%.3f %.3f %.3f] mm\n', ...
+            ds.size(1), ds.size(2), ds.size(3), ds.spacing);
+        fprintf(fid, 'HU range: [%.0f, %.0f]\n\n', min(ds.HU(:)), max(ds.HU(:)));
+        fprintf(fid, 'Bones found: %d\n', n_bones);
+        fprintf(fid, 'Markers found: %d\n\n', sep_result.n_tags);
+        total_vol = 0;
+        for bi = 1:n_bones
+            b = sep_result.bones{bi};
+            total_vol = total_vol + b.volume_mm3;
+            if ~isempty(b.tag_id)
+                tag_str = sprintf('tag %d (%.1f mm)', b.tag_id, b.tag_dist);
+            else
+                tag_str = 'no tag';
+            end
+            fprintf(fid, 'Bone %d: %.1f mm^3 | mean HU %.0f | dense %.0f%% | %s\n', ...
+                bi, b.volume_mm3, b.mean_hu, b.dense_fraction*100, tag_str);
+            fprintf(fid, '  Centroid: [%.1f %.1f %.1f] mm\n', b.centroid_mm);
+            fprintf(fid, '  BBox: [%d %d %d] to [%d %d %d]\n', b.bbox);
+        end
+        fprintf(fid, '\nTotal bone volume: %.0f mm^3\n', total_vol);
+        fclose(fid);
+        fprintf('  Saved pipeline_summary.txt\n');
+    catch ME
+        warning('Save summary failed: %s', ME.message);
+    end
+
     fprintf('  All outputs saved to: %s\n', outDir);
     out.outputDir = outDir;
 end
@@ -226,7 +260,6 @@ fprintf('============================================================\n');
 total_vol = 0;
 for bi = 1:n_bones
     b = sep_result.bones{bi};
-    seg = seg_results{bi};
     total_vol = total_vol + b.volume_mm3;
 
     if ~isempty(b.tag_id)
