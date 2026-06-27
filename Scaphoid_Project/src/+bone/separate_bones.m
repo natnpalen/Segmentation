@@ -122,19 +122,47 @@ for si = 1:numel(seeds)
     fprintf('      Seed stats: mu1=%.0f, s1=%.0f (from %d component voxels)\n', ...
         mu1, s1_stat, numel(comp_vals));
 
-    % Build FMM weight map (scaphoid buildWeights approach — NO normalization)
+    % === Scaphoid-style allow region: core -> allow -> imreconstruct ===
+    % This is THE critical step the scaphoid pipeline uses to prevent FMM
+    % from leaking into markers and non-bone material. Build a connected
+    % bone-shaped allow region, then block everything outside it.
+    G_L = imgradient3(vol_L);
+
+    vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
+    if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
+    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
+    core_L = vol_L > core_thr_L;
+
+    % Allow = moderate HU OR high gradient (catches cancellous bone)
+    HU_ALLOW_MIN = max(70, min(220, softMed + 110));
+    gThr_L = prctile(G_L(:), 85);
+    maskR_L = (vol_L > HU_ALLOW_MIN) | (G_L > gThr_L);
+
+    % Flood-fill from core through allow — gives connected bone region
+    if any(core_L(:))
+        allow_L = imreconstruct(core_L, maskR_L);
+    else
+        allow_L = maskR_L;
+    end
+    % Exclude markers and already-assigned bones from allow
+    allow_L = allow_L & ~mk_L & ~lead_L & ~all_L;
+    fprintf('      Allow region: core=%d, allow=%d voxels\n', nnz(core_L), nnz(allow_L));
+
+    % Build FMM weight map
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
 
-    % Hard-block: air, lead metal, already-assigned bones
-    % Blocking air is critical — without it, FMM floods the entire ROI
-    % through air, making the distance field useless for discrimination.
-    W_L(vol_L < -300) = eps;
-    W_L(lead_L) = eps;
-    W_L(all_L) = eps;
+    % Block everything outside the allow region (scaphoid line 94)
+    W_L(~allow_L) = eps;
+
+    % Robust percentile normalization (scaphoid lines 97-99)
+    Lo = prctile(W_L(:), 1);
+    Hi = prctile(W_L(:), 99);
+    W_L = min(max((W_L - Lo) / max(eps, Hi - Lo), 0), 1);
+    W_L = max(W_L, eps);
 
     fprintf('      W range: [%.4f, %.4f]\n', min(W_L(:)), max(W_L(:)));
 
-    % Run FMM (pass weights directly, as scaphoid does — no normalization)
+    % Run FMM
     th0 = min(max(0.01, mean(W_L(seedMask_L)) * 0.5), 0.99);
     fprintf('      FMM th0: %.4f\n', th0);
 
@@ -152,7 +180,6 @@ for si = 1:numel(seeds)
     specimen_L = imclose(specimen_L, strel('sphere', 1));
 
     % Adaptive threshold sweep (scaphoid approach)
-    G_L = imgradient3(vol_L);
     mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L);
 
     if ~any(mask_bone_L(:))
@@ -162,14 +189,10 @@ for si = 1:numel(seeds)
     fprintf('      After threshold: %d voxels (%.0f mm^3)\n', ...
         nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
-    % Don't overlap with already-assigned bone voxels
-    mask_bone_L = mask_bone_L & ~all_L;
+    % Constrain to allow region (no marker/metal/assigned leakage)
+    mask_bone_L = mask_bone_L & allow_L;
 
-    % Hard-remove lead metal from bone mask
-    mask_bone_L = mask_bone_L & ~lead_L;
-
-    % Shell sealing FIRST (close gaps + fill interior), then remove markers.
-    % Order matters: if we remove markers first, imclose re-bridges to them.
+    % Shell sealing: close small gaps, fill interior
     mask_bone_L = seal_outer_shell(mask_bone_L, spacing);
 
     if ~any(mask_bone_L(:))
@@ -177,20 +200,7 @@ for si = 1:numel(seeds)
         continue;
     end
 
-    % NOW remove all marker material (lead + dense + light flags)
-    mask_bone_L = mask_bone_L & ~mk_L;
-    mask_bone_L = mask_bone_L & ~lead_L;
-
-    % Fill any holes left by marker removal, keep largest
-    mask_bone_L = imfill(mask_bone_L, 'holes');
-    mask_bone_L = keep_largest_3d(mask_bone_L);
-
-    if ~any(mask_bone_L(:))
-        fprintf('      -> empty after marker removal, skipped\n');
-        continue;
-    end
-
-    fprintf('      After seal+carve: %d voxels (%.0f mm^3)\n', ...
+    fprintf('      After seal: %d voxels (%.0f mm^3)\n', ...
         nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Paste back to full volume
