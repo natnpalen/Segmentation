@@ -525,31 +525,56 @@ end
 
 % =========================================================================
 %  MARKER AND ARTIFACT MAPS
-%  Detects the full marker assembly: lead letter (HU>1200), dense flags
-%  (~700-1200 HU near lead), and light flags/housing (200-700 HU near lead).
+%  Controlled limited growth from lead cores to capture marker assemblies
+%  (lead letters + flag tabs) WITHOUT leaking into bone tissue.
 % =========================================================================
 function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, sigma_mm, spacing)
     % Lead letter cores: HU > 3000 (actual lead is 4000-7000 HU)
     lead = HU > 3000;
 
-    % Flood-fill from lead through all connected non-air material.
-    % This captures the ENTIRE marker assembly (lead + flags + housing)
-    % regardless of exact HU values, because the assembly is one
-    % connected piece surrounded by air. Stops at air gaps naturally.
-    non_air = HU > -200;
-    non_air = imclose(non_air, strel('sphere', 1));
-    if any(lead(:))
-        marker_flood = imreconstruct(lead, non_air);
-    else
-        marker_flood = false(size(HU));
+    if ~any(lead(:))
+        marker_mask = false(size(HU));
+        marker_core = marker_mask;
+        d_mm = bwdist(marker_mask) * mean(spacing);
+        artifact_w = exp(-(d_mm / sigma_mm).^2);
+        fprintf('    Marker detection: no lead found\n');
+        return;
     end
 
-    % Separate into core (lead + dense flag, >1000 HU) and full assembly
-    marker_core = marker_flood & (HU > 1000);
-    marker_mask = marker_flood;
+    % Controlled iterative dilation from lead cores.
+    % Each step only grows into voxels above FLAG_HU_MIN, capturing the
+    % flag tabs (~700-1200 HU) attached to each lead letter. Growth is
+    % limited to MAX_STEPS iterations so it cannot flood into bone even
+    % when the marker physically contacts bone tissue.
+    FLAG_HU_MIN = 400;
+    MAX_STEPS = 8;
+    mean_sp = mean(spacing);
+    max_extent_mm = MAX_STEPS * mean_sp;
 
-    fprintf('    Marker detection: lead=%d, flood=%d, core=%d voxels\n', ...
-        nnz(lead), nnz(marker_mask), nnz(marker_core));
+    SE = strel('sphere', 1);
+    grown = lead;
+    growable = HU > FLAG_HU_MIN;
+
+    for step = 1:MAX_STEPS
+        expanded = imdilate(grown, SE);
+        new_voxels = expanded & growable & ~grown;
+        if ~any(new_voxels(:)), break; end
+        grown = grown | new_voxels;
+    end
+
+    % Per-assembly isolation: only keep grown regions connected to lead
+    CC_grown = bwconncomp(grown, 26);
+    marker_mask = false(size(HU));
+    for i = 1:CC_grown.NumObjects
+        if any(lead(CC_grown.PixelIdxList{i}))
+            marker_mask(CC_grown.PixelIdxList{i}) = true;
+        end
+    end
+
+    marker_core = marker_mask & (HU > 1000);
+
+    fprintf('    Marker detection: lead=%d, grown=%d (max %.1fmm, %d steps, HU>%d), core=%d voxels\n', ...
+        nnz(lead), nnz(marker_mask), max_extent_mm, MAX_STEPS, FLAG_HU_MIN, nnz(marker_core));
 
     % Artifact weight field: Gaussian decay from marker boundary
     d_vox = bwdist(marker_mask);
