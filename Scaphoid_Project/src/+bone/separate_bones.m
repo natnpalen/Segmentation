@@ -24,7 +24,7 @@ lead_metal = vol > 4000;
 
 % ---- Stage 1: Markers and artifact field ----
 fprintf('  [Separate] Stage 1: Marker detection & artifact field...\n');
-[marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.ArtifactSigmaMM, spacing);
+[marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(vol, opts.ArtifactSigmaMM, spacing);
 metal = vol > opts.TagHUMin;
 
 fprintf('    Marker mask: %d voxels (%.0f mm^3)\n', sum(marker_mask(:)), sum(marker_mask(:))*voxel_vol);
@@ -124,7 +124,10 @@ for si = 1:numel(seeds)
     % Build FMM weight map (scaphoid buildWeights approach — NO normalization)
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
 
-    % Hard-block lead metal and already-assigned bones in the weight map
+    % Hard-block: air, lead metal, already-assigned bones
+    % Blocking air is critical — without it, FMM floods the entire ROI
+    % through air, making the distance field useless for discrimination.
+    W_L(vol_L < -300) = eps;
     W_L(lead_L) = eps;
     W_L(all_L) = eps;
 
@@ -183,8 +186,9 @@ for si = 1:numel(seeds)
     mask_bone = false(sz);
     mask_bone(r1:r2, c1:c2, s1:s2) = mask_bone_L;
 
-    % Final hard-remove of all marker material from bone mask
-    mask_bone = mask_bone & ~marker_mask;
+    % Remove definite marker material (lead+dense flags, NOT light flags
+    % which overlap with real bone tissue at 200-700 HU)
+    mask_bone = mask_bone & ~marker_core;
 
     bone_vol = sum(mask_bone(:)) * voxel_vol;
     if bone_vol < opts.MinBoneVolMM3
@@ -385,9 +389,13 @@ end
 %  FMM WEIGHT MAP (scaphoid buildWeights, using component-learned stats)
 % =========================================================================
 function W = build_fmm_weights_local(vol, seedMask, artifact_w, mu1, s1)
+    % Cap volume to exclude metal extremes from gradient/normalization.
+    % Metal voxels (4000-7000 HU) dominate mat2gray, squashing bone weights.
+    vol_cap = max(-500, min(vol, 2000));
+
     % Background stats from shell around seed
     bg = imdilate(seedMask, strel('sphere', 6)) & ~imdilate(seedMask, strel('sphere', 2));
-    bgVals = vol(bg);
+    bgVals = vol_cap(bg);
     if isempty(bgVals)
         mu0 = -300;
         s0 = 100;
@@ -396,11 +404,10 @@ function W = build_fmm_weights_local(vol, seedMask, artifact_w, mu1, s1)
         s0 = mad(bgVals, 1) + 50;
     end
 
-    pBone = 1 ./ (1 + exp(-(vol - mu1) ./ s1));
-    pTiss = 1 ./ (1 + exp(-(mu0 - vol) ./ s0));
+    pBone = 1 ./ (1 + exp(-(vol_cap - mu1) ./ s1));
+    pTiss = 1 ./ (1 + exp(-(mu0 - vol_cap) ./ s0));
 
-    % Use gradientweight (same as scaphoid buildWeights)
-    edgeW = 1 - mat2gray(gradientweight(vol));
+    edgeW = 1 - mat2gray(gradientweight(vol_cap));
     dataW = mat2gray(pBone ./ (pTiss + eps));
 
     alpha = 1.0; beta = 0.5; gamma = 1.0;
@@ -558,7 +565,7 @@ end
 %  Detects the full marker assembly: lead letter (HU>1200), dense flags
 %  (~700-1200 HU near lead), and light flags/housing (200-700 HU near lead).
 % =========================================================================
-function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, sigma_mm, spacing)
+function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, sigma_mm, spacing)
     % Lead letter cores: HU > 1200 (typically 4000-7000 HU)
     lead = HU > 1200;
 
@@ -566,11 +573,16 @@ function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, sigma_mm, spac
     % Flags can be ~1mm from the letter; at 0.25mm spacing that's 4 voxels
     dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 5));
 
-    % Light flags/housing: 200-700 HU within 4 voxels of lead or dense flags
+    % Light flags/housing: 200-700 HU within 2 voxels of lead+dense only
+    % Keep radius small — this HU range overlaps real bone tissue
     lead_plus_dense = lead | dense_flags;
-    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 4));
+    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 2));
 
     marker_mask = lead | dense_flags | light_flags;
+
+    % Core marker mask (lead + dense only) — used for hard-block carving
+    % that won't accidentally remove bone tissue
+    marker_core = lead | dense_flags;
 
     fprintf('    Marker layers: lead=%d, dense_flags=%d, light_flags=%d, total=%d voxels\n', ...
         nnz(lead), nnz(dense_flags), nnz(light_flags), nnz(marker_mask));
