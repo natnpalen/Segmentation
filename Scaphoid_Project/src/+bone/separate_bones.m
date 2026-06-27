@@ -468,75 +468,33 @@ end
 % =========================================================================
 %  POST-PROCESSING (scaphoid approach: marker carve + boundary refinement)
 % =========================================================================
-function mask = postprocess_bone(mask, marker_mask, lead_metal, vol, G, softMed, core, spacing)
+function mask = postprocess_bone(mask, marker_mask, lead_metal, vol, ~, ~, ~, spacing)
     if ~any(mask(:)), return; end
 
-    % Hard-remove lead metal (HU>4000) — never allowed in bone mask
+    pre_vox = nnz(mask);
+
+    % Hard-remove lead metal (HU>4000)
     mask = mask & ~lead_metal;
 
-    % Fill holes, remove tiny fragments
+    % Remove marker material from the bone surface but protect deep interior
+    interior = imerode(mask, strel('sphere', 2));
+    interior = interior & ~lead_metal;
+    mask = (mask & ~marker_mask) | interior;
+
+    % Fill holes and remove tiny fragments
     mask = imfill(mask, 'holes');
     mask = bwareaopen(mask, 500);
-
-    % Scaphoid-style marker carve: remove markers at boundary, protect interior
-    % but never protect voxels overlapping with marker material
-    interior = imerode(mask, strel('sphere', 1));
-    interior = interior & ~marker_mask;
-    mask = (mask & ~imdilate(marker_mask, strel('sphere', 1))) | interior;
-
     mask = keep_largest_3d(mask);
     if ~any(mask(:)), return; end
 
-    % Boundary-band cling (scaphoid lines 206-223)
-    voxmm = mean(spacing);
-    D_in = bwdist(~mask) * voxmm;
-    deep_interior = D_in >= 1.0;
-    band = mask & ~deep_interior;
-
-    vals = vol(~marker_mask & vol > -300 & vol < 2000);
-    if isempty(vals), vals = vol(isfinite(vol)); end
-    band_core_thr = max(240, min(650, prctile(vals, 92)));
-    core_seed = band & (vol > band_core_thr);
-    HU_SUPPORT_MIN = max(60, min(180, softMed + 90));
-    gThr = prctile(G(:), 80);
-    support = band & ((vol > HU_SUPPORT_MIN) | (G > gThr));
-    if any(core_seed(:))
-        cling_band = imreconstruct(core_seed, support);
-        mask = deep_interior | cling_band;
-    end
-
-    mask = keep_largest_3d(mask);
-    if ~any(mask(:)), return; end
-    mask = imclose(mask, strel('sphere', 1));
+    % Close small gaps left by marker removal
+    mask = imclose(mask, strel('sphere', 2));
     mask = imfill(mask, 'holes');
-
-    % Edge-backed perimeter prune (scaphoid lines 225-236)
-    perim = bwperim(mask, 26);
-    band1 = imdilate(perim, strel('sphere', 1));
-    T_hu = max(160, min(340, softMed + 190));
-    T_g = prctile(G(:), 70);
-    kill = band1 & (vol < T_hu) & (G < T_g);
-    if any(kill(:))
-        mask(kill) = false;
-        mask = keep_largest_3d(mask);
-        mask = imclose(mask, strel('sphere', 1));
-        mask = imfill(mask, 'holes');
-    end
-
-    % Final boundary carve (scaphoid lines 258-264)
-    band = imdilate(bwperim(mask, 26), strel('sphere', 1));
-    HU_CARVE_FLOOR = max(180, min(400, softMed + 220));
-    kill = band & (vol < HU_CARVE_FLOOR);
-    if any(kill(:))
-        mask(kill) = false;
-    end
-
-    % Final cleanup
     mask = keep_largest_3d(mask);
-    mask = imopen(mask, strel('sphere', 1));
-    mask = keep_largest_3d(mask);
-    mask = imclose(mask, strel('sphere', 1));
-    mask = imfill(mask, 'holes');
+
+    post_vox = nnz(mask);
+    fprintf('      Post-process: %d -> %d voxels (%.0f%% retained)\n', ...
+        pre_vox, post_vox, 100*post_vox/max(1, pre_vox));
 end
 
 
@@ -644,24 +602,32 @@ function CC_out = merge_nearby_components(CC, sz, merge_dist_vox)
     n = CC.NumObjects;
     parent = 1:n;
 
-    % Check pairwise distances between components
+    % Compute distance transforms for each component
     dists = cell(n, 1);
+    comp_vols = zeros(n, 1);
     for i = 1:n
         m = false(sz);
         m(CC.PixelIdxList{i}) = true;
         dists{i} = bwdist(m);
+        comp_vols(i) = numel(CC.PixelIdxList{i});
     end
 
+    % Print pairwise distances so we can debug merge decisions
+    fprintf('    Pairwise component distances (merge threshold: %.1f vox):\n', merge_dist_vox);
     for i = 1:n
         for j = (i+1):n
             min_d = min(dists{i}(CC.PixelIdxList{j}));
+            merged_str = '';
             if min_d <= merge_dist_vox
+                merged_str = ' -> MERGE';
                 ri = i; while parent(ri) ~= ri, ri = parent(ri); end
                 rj = j; while parent(rj) ~= rj, rj = parent(rj); end
                 if ri ~= rj
                     parent(rj) = ri;
                 end
             end
+            fprintf('      C%d (%d vox) <-> C%d (%d vox): %.1f vox%s\n', ...
+                i, comp_vols(i), j, comp_vols(j), min_d, merged_str);
         end
     end
 

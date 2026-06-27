@@ -55,22 +55,7 @@ for bi = 1:n_bones
     end
 end
 
-% Show only actual metal (HU>1200) as red markers — NOT the full marker_mask
-% which includes flag-range voxels that overlap with cortical bone
-metal_mask = vol > 1200;
-if any(metal_mask(:))
-    try
-        fv_mk = isosurface(smooth3(double(metal_mask), 'gaussian', 3), 0.5);
-        if ~isempty(fv_mk.vertices)
-            fv_mk.vertices(:,1) = fv_mk.vertices(:,1) * spacing(2);
-            fv_mk.vertices(:,2) = fv_mk.vertices(:,2) * spacing(1);
-            fv_mk.vertices(:,3) = fv_mk.vertices(:,3) * spacing(3);
-            patch(fv_mk, 'FaceColor', [1 0 0], 'EdgeColor', 'none', ...
-                'FaceAlpha', 0.9);
-        end
-    catch
-    end
-end
+% Markers intentionally NOT shown — bones only
 
 axis equal vis3d off;
 camlight headlight; lighting gouraud;
