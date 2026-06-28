@@ -106,16 +106,20 @@ else
 end
 
 % ==== Stage 4: Cortical / Cancellous Segmentation ====
-% Skipped until bone separation is correct
-fprintf('[Stage 4] Skipped (bone separation still being refined)\n\n');
+fprintf('[Stage 4] Cortical / cancellous segmentation...\n');
 seg_results = cell(1, n_bones);
 for bi = 1:n_bones
-    seg_results{bi} = struct('cortical', false(size(ds.HU)), ...
-        'cancellous', false(size(ds.HU)), ...
-        'info', struct('otsu_threshold', 0, 'cortical_thickness_mm', 0, ...
-            'cortical_volume_mm3', 0, 'cancellous_volume_mm3', 0, ...
-            'cortical_fraction', 0));
+    fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
+        sep_result.bones{bi}.volume_mm3);
+    [cort, canc, seg_info] = bone.cortical_cancellous(ds, sep_result.bones{bi}.mask, opts);
+    seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+    fprintf('    Otsu: %.0f HU | cortical thickness: %.2f mm\n', ...
+        seg_info.otsu_threshold, seg_info.cortical_thickness_mm);
+    fprintf('    Cortical: %.0f mm^3 (%.0f%%) | Cancellous: %.0f mm^3\n', ...
+        seg_info.cortical_volume_mm3, seg_info.cortical_fraction*100, ...
+        seg_info.cancellous_volume_mm3);
 end
+fprintf('\n');
 
 % ==== Stage 5: Specimen Packing ====
 % Skipped until bone separation is correct

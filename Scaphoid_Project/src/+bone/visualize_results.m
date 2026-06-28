@@ -62,16 +62,82 @@ camlight headlight; lighting gouraud;
 title(sprintf('Bone Separation: %d bones found', n_bones));
 rotate3d on;
 
-% ---- Save figure ----
+% ---- Cortical / Cancellous 3D view ----
+has_seg = ~isempty(seg_results) && numel(seg_results) >= n_bones && ...
+    isstruct(seg_results{1}) && isfield(seg_results{1}, 'info') && ...
+    seg_results{1}.info.cortical_volume_mm3 > 0;
+
+if has_seg
+    fig2 = figure('Name', 'Cortical / Cancellous Segmentation', 'Color', 'w', ...
+        'Position', [100 100 900 700]);
+
+    for bi = 1:n_bones
+        cort = seg_results{bi}.cortical;
+        canc = seg_results{bi}.cancellous;
+
+        % Cortical shell — opaque, bone-tinted
+        if any(cort(:))
+            try
+                fv_c = isosurface(smooth3(double(cort), 'gaussian', 3), 0.5);
+                if ~isempty(fv_c.vertices)
+                    fv_c.vertices(:,1) = fv_c.vertices(:,1) * spacing(2);
+                    fv_c.vertices(:,2) = fv_c.vertices(:,2) * spacing(1);
+                    fv_c.vertices(:,3) = fv_c.vertices(:,3) * spacing(3);
+                    patch(fv_c, 'FaceColor', colors(bi,:), 'EdgeColor', 'none', ...
+                        'FaceAlpha', 0.3);
+                    hold on;
+                end
+            catch, end
+        end
+
+        % Cancellous interior — darker shade, semi-transparent
+        if any(canc(:))
+            try
+                fv_n = isosurface(smooth3(double(canc), 'gaussian', 3), 0.5);
+                if ~isempty(fv_n.vertices)
+                    fv_n.vertices(:,1) = fv_n.vertices(:,1) * spacing(2);
+                    fv_n.vertices(:,2) = fv_n.vertices(:,2) * spacing(1);
+                    fv_n.vertices(:,3) = fv_n.vertices(:,3) * spacing(3);
+                    patch(fv_n, 'FaceColor', colors(bi,:)*0.5, 'EdgeColor', 'none', ...
+                        'FaceAlpha', 0.6);
+                    hold on;
+                end
+            catch, end
+        end
+
+        cm = bones{bi}.centroid_mm;
+        si = seg_results{bi}.info;
+        lbl = sprintf('Bone %d\nCort %.0f%% (%.0f HU)', ...
+            bi, si.cortical_fraction*100, si.otsu_threshold);
+        text(cm(2), cm(1), cm(3), lbl, 'FontSize', 9, 'FontWeight', 'bold', ...
+            'HorizontalAlignment', 'center', 'Color', colors(bi,:)*0.6);
+    end
+
+    axis equal vis3d off;
+    camlight headlight; lighting gouraud;
+    title('Cortical (translucent) / Cancellous (solid) Segmentation');
+    rotate3d on;
+end
+
+% ---- Save figures ----
 if isfield(opts, 'OutputDir') && ~isempty(opts.OutputDir)
     outDir = opts.OutputDir;
     if ~exist(outDir, 'dir'), mkdir(outDir); end
 
     try
         saveas(fig1, fullfile(outDir, 'bone_separation_3d.png'));
-        fprintf('  [Viz] Saved figure to %s\n', outDir);
+        fprintf('  [Viz] Saved bone_separation_3d.png\n');
     catch ME
         warning('Figure save failed: %s', ME.message);
+    end
+
+    if has_seg
+        try
+            saveas(fig2, fullfile(outDir, 'cortical_cancellous_3d.png'));
+            fprintf('  [Viz] Saved cortical_cancellous_3d.png\n');
+        catch ME
+            warning('Figure save failed: %s', ME.message);
+        end
     end
 end
 end
