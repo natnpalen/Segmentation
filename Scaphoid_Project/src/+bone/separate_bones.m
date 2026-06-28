@@ -125,28 +125,30 @@ for si = 1:numel(seeds)
     % === Scaphoid-style allow region: core -> allow -> imreconstruct ===
     G_L = imgradient3(vol_L);
 
-    % Distance from lead in local ROI (mm) — used to suppress flag tabs
+    % Distance from lead and from full marker mask (mm)
     d_lead_L = bwdist(lead_L) * mean(spacing);
+    d_mk_L_allow = bwdist(mk_L) * mean(spacing);
 
     vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
     if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
     core_thr_L = max(280, min(700, prctile(vals_L, 94)));
     core_L = vol_L > core_thr_L;
 
-    % Exclude near-lead voxels from core: flag tabs (700-1200 HU) sit
-    % within ~3-5mm of lead and would otherwise seed the allow region,
-    % connecting flags to bone through imreconstruct.
+    % Exclude near-marker voxels from core and reachable mask.
+    % Use 5mm from lead (catches flag tabs at lead) PLUS 2mm from the
+    % full marker mask (catches tissue clinging to the outer flag edge).
     LEAD_BUFFER_MM = 5.0;
-    near_lead_L = d_lead_L < LEAD_BUFFER_MM;
-    core_L = core_L & ~near_lead_L;
+    MARKER_BUFFER_MM = 2.0;
+    near_marker_L = (d_lead_L < LEAD_BUFFER_MM) | (d_mk_L_allow < MARKER_BUFFER_MM);
+    core_L = core_L & ~near_marker_L;
 
     % Allow = moderate HU OR high gradient (catches cancellous bone)
     HU_ALLOW_MIN = max(70, min(220, softMed + 110));
     gThr_L = prctile(G_L(:), 85);
     maskR_L = (vol_L > HU_ALLOW_MIN) | (G_L > gThr_L);
 
-    % Also exclude near-lead from the reachable mask
-    maskR_L = maskR_L & ~near_lead_L;
+    % Also exclude near-marker from the reachable mask
+    maskR_L = maskR_L & ~near_marker_L;
 
     % Flood-fill from core through allow — gives connected bone region
     if any(core_L(:))
@@ -156,8 +158,8 @@ for si = 1:numel(seeds)
     end
     % Exclude markers and already-assigned bones from allow
     allow_L = allow_L & ~mk_L & ~lead_L & ~all_L;
-    fprintf('      Allow region: core=%d, allow=%d, lead_buffer=%d voxels\n', ...
-        nnz(core_L), nnz(allow_L), nnz(near_lead_L));
+    fprintf('      Allow region: core=%d, allow=%d, marker_buffer=%d voxels\n', ...
+        nnz(core_L), nnz(allow_L), nnz(near_marker_L));
 
     % Build FMM weight map
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
