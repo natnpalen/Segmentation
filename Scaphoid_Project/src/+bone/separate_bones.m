@@ -798,10 +798,13 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     end
 
     % --- Step 5: Final cleanup ---
+    % Opening with sphere(2) severs thin tissue bridges (~0.5mm) that
+    % connect small blobs to the main bone body. The bulk bone (many mm
+    % across) survives easily; only thin protrusions get pruned.
     mask = keep_largest_3d(mask);
-    mask = imopen(mask, strel('sphere', 1));
+    mask = imopen(mask, strel('sphere', 2));
     mask = keep_largest_3d(mask);
-    mask = imclose(mask, strel('sphere', 1));
+    mask = imclose(mask, strel('sphere', 2));
     mask = imfill(mask, 'holes');
 end
 
