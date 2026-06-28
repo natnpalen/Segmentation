@@ -212,8 +212,10 @@ for si = 1:numel(seeds)
     end
 
     % Remove marker material AFTER sealing (imclose can re-bridge).
-    flag_hu_thr_L = 300 + 150 * d_lead_L;
-    flag_carve_L = (d_lead_L < 4.0) & (vol_L > flag_hu_thr_L);
+    % Use distance from the full marker mask (not just lead) so the carve
+    % reaches flag tabs that extend beyond 4mm from the lead letter.
+    d_mk_L = bwdist(mk_L) * mean(spacing);
+    flag_carve_L = (d_mk_L < 2.0) & (vol_L > 250);
     mask_bone_L = mask_bone_L & ~mk_L & ~lead_L & ~flag_carve_L;
     mask_bone_L = imfill(mask_bone_L, 'holes');
     mask_bone_L = keep_largest_3d(mask_bone_L);
