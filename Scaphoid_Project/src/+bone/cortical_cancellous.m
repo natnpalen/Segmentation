@@ -67,7 +67,7 @@ max_depth = max(D_mm(bone_tissue_mask));
 DEPTH_BIN_MM = 0.25;
 n_depth_bins = max(8, round(max_depth / DEPTH_BIN_MM));
 depth_edges = linspace(0, max_depth, n_depth_bins + 1);
-depth_centers = (depth_edges(1:end-1) + depth_edges(2:end)) / 2;
+depth_centers = ((depth_edges(1:end-1) + depth_edges(2:end)) / 2)';  % column vector
 
 fprintf('      Max depth: %.2f mm (%d depth bins)\n', max_depth, n_depth_bins);
 
