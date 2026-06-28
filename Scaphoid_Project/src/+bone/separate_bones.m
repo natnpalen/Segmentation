@@ -756,10 +756,10 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
 
     % --- Step 2: Edge-backed perimeter prune ---
     % Kill perimeter voxels with BOTH low HU AND low gradient.
-    % Tissue has low HU + smooth gradients; cortical bone has high gradient.
+    % Thresholds scale with bone density so low-density bones aren't destroyed.
     perim = bwperim(mask, 26);
     band1 = imdilate(perim, strel('sphere', 1));
-    T_hu = max(160, min(340, softMed + 190));
+    T_hu = max(80, min(340, softMed * 0.7));
     T_g = prctile(G(:), 70);
     kill = band1 & (double(vol) < T_hu) & (G < T_g);
     if any(kill(:))
@@ -775,8 +775,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     band1 = imdilate(perim, strel('sphere', 1));
     outer1 = imdilate(mask, strel('sphere', 1)) & ~mask;
     protected_core = imdilate(vol > core_thr, strel('sphere', 2));
-    T_hi = max(170, min(360, softMed + 210));
-    T_lo = T_hi - 80;
+    T_lo = max(80, min(280, softMed * 0.5));
     airNear = outer1 & imdilate(vol < -300, strel('sphere', 1));
     kill = band1 & (double(vol) < T_lo) & imdilate(airNear, strel('sphere', 1)) & ~protected_core;
     if any(kill(:))
@@ -788,7 +787,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
 
     % --- Step 4: Final boundary carve ---
     band1 = imdilate(bwperim(mask, 26), strel('sphere', 1));
-    HU_CARVE_FLOOR = max(180, min(400, softMed + 220));
+    HU_CARVE_FLOOR = max(80, min(300, softMed * 0.6));
     kill = band1 & (double(vol) < HU_CARVE_FLOOR);
     if any(kill(:))
         mask(kill) = false;
