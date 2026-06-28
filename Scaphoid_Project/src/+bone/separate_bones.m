@@ -247,6 +247,15 @@ for si = 1:numel(seeds)
         continue;
     end
 
+    % Surface tissue scrub: remove low-density voxels clinging to surface
+    n_before_scrub = nnz(mask_bone_L);
+    mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing);
+    n_after_scrub = nnz(mask_bone_L);
+    if n_after_scrub < n_before_scrub
+        fprintf('      Surface scrub: removed %d voxels (%.0f mm^3)\n', ...
+            n_before_scrub - n_after_scrub, (n_before_scrub - n_after_scrub)*voxel_vol);
+    end
+
     fprintf('      After seal+carve: %d voxels (%.0f mm^3)\n', ...
         nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
@@ -826,6 +835,53 @@ function BW = seal_outer_shell(BW, spacing)
     % No imclearborder — for excised-in-air specimens the bone itself
     % often spans the full height of the local ROI, so clearing border
     % voxels destroys the entire mask.
+end
+
+
+% =========================================================================
+%  SURFACE TISSUE SCRUB
+% =========================================================================
+function mask = scrub_surface_tissue(mask, vol, spacing)
+% Remove low-density surface voxels that are likely residual soft tissue.
+% Only touches the outermost shell (within 1 voxel of air). Compares
+% surface HU against the bone's interior median to identify tissue.
+
+    if nnz(mask) < 100, return; end
+
+    voxmm = mean(spacing);
+
+    % Distance from bone surface
+    D = bwdist(~mask) * voxmm;
+
+    % Interior reference: median HU of voxels > 1mm from surface
+    interior = mask & (D > 1.0);
+    if nnz(interior) < 20
+        interior = mask & (D > 0.5);
+    end
+    if nnz(interior) < 20, return; end
+
+    interior_med = median(vol(interior));
+
+    % Surface shell: bone voxels within 1 voxel of air
+    SE = strel('sphere', 1);
+    eroded = imerode(mask, SE);
+    surface_shell = mask & ~eroded;
+
+    if ~any(surface_shell(:)), return; end
+
+    % Tissue threshold: surface voxels far below interior density
+    % Use 25% of interior median, with a floor of 80 HU
+    tissue_thr = max(80, interior_med * 0.25);
+
+    % Remove surface voxels below threshold
+    to_remove = surface_shell & (vol < tissue_thr);
+
+    if ~any(to_remove(:)), return; end
+
+    mask = mask & ~to_remove;
+
+    % Connectivity guard: keep largest component
+    mask = keep_largest_3d(mask);
 end
 
 
