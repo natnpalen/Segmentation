@@ -219,12 +219,22 @@ for si = 1:numel(seeds)
     mask_bone_L = keep_largest_3d(mask_bone_L);
 
     % === Boundary refinement (ported from scaphoid pipeline) ===
-    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, softMed);
+    % Use LOCAL bone median HU, not global softMed. Each bone has
+    % different density — the pisiform (mean HU ~215) needs much lower
+    % thresholds than metacarpals (mean HU ~500-600).
+    bone_vals_L = vol_L(mask_bone_L & vol_L > -200);
+    if numel(bone_vals_L) >= 20
+        local_softMed = median(bone_vals_L);
+    else
+        local_softMed = softMed;
+    end
+    fprintf('      Local softMed: %.0f HU (global: %.0f)\n', local_softMed, softMed);
+    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed);
 
     % Remove small disconnected blobs using 6-connectivity (face-touching
     % only). Corner-connected fragments that look disconnected in the
     % smoothed STL mesh get eliminated here.
-    min_keep_vox = max(200, round(200 / voxel_vol));
+    min_keep_vox = max(50, round(30 / voxel_vol));
     mask_bone_L = bwareaopen(mask_bone_L, min_keep_vox, 6);
     mask_bone_L = keep_largest_3d(mask_bone_L);
 
