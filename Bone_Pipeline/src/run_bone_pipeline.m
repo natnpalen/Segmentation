@@ -29,13 +29,6 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'OutputDir'           : ''   (auto-create if empty)
 %   'ShowViewer'          : true (show 3D visualization)
 
-% ---- Ensure shared packages are on the path ----
-thisDir = fileparts(mfilename('fullpath'));
-sharedSrc = fullfile(fileparts(fileparts(thisDir)), 'Scaphoid_Project', 'src');
-if exist(sharedSrc, 'dir') && ~contains(path, sharedSrc)
-    addpath(sharedSrc);
-end
-
 % ---- Parse options ----
 opts = struct( ...
     'TagHUMin',            1200, ...

@@ -27,10 +27,8 @@ fprintf('  [Separate] Stage 1: Marker detection & artifact field...\n');
 [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(vol, opts.ArtifactSigmaMM, spacing);
 metal = vol > opts.TagHUMin;
 
-fprintf('    Marker mask: %d voxels (%.0f mm^3)\n', sum(marker_mask(:)), sum(marker_mask(:))*voxel_vol);
-fprintf('    Metal (HU>%d): %d voxels (%.0f mm^3)\n', opts.TagHUMin, sum(metal(:)), sum(metal(:))*voxel_vol);
-fprintf('    Lead metal (HU>4000): %d voxels\n', nnz(lead_metal));
-fprintf('    Artifact sigma: %.1f mm\n', opts.ArtifactSigmaMM);
+fprintf('    Markers: %.0f mm^3, metal: %.0f mm^3\n', ...
+    sum(marker_mask(:))*voxel_vol, sum(metal(:))*voxel_vol);
 
 % Identify individual marker assemblies from actual lead (HU>3000),
 % not the opts.TagHUMin threshold which is too low for assembly detection
@@ -49,20 +47,11 @@ for i = 1:CC_metal.NumObjects
     end
 end
 fprintf('    Marker assemblies: %d\n', numel(real_tags));
-for t = 1:numel(real_tags)
-    fprintf('      Marker %d: %.1f mm^3 at [%.1f %.1f %.1f] mm\n', ...
-        t, real_tags{t}.volume_mm3, real_tags{t}.centroid_mm);
-end
 
 % ---- Stage 2: Find seed points (one per bone) ----
 fprintf('  [Separate] Stage 2: Finding bone seed points...\n');
 seeds = find_bone_seeds(vol, marker_mask, spacing, opts.MinBoneVolMM3);
 fprintf('    Found %d seed points\n', numel(seeds));
-for si = 1:numel(seeds)
-    seed_hu = vol(seeds{si}.ijk(1), seeds{si}.ijk(2), seeds{si}.ijk(3));
-    fprintf('      Seed %d: [%d %d %d] vox, HU=%.0f, component %.0f mm^3 (mean HU %.0f), score %.2f\n', ...
-        si, seeds{si}.ijk, seed_hu, seeds{si}.comp_vol_mm3, seeds{si}.comp_mean_hu, seeds{si}.score);
-end
 
 if isempty(seeds)
     warning('No bone seeds found.');
@@ -77,7 +66,6 @@ fprintf('  [Separate] Stage 3: Growing bones from seeds (FMM)...\n');
 % Global stats (used for thresholds)
 softMed = median(vol(vol > -300), 'omitnan');
 if ~isfinite(softMed), softMed = -300; end
-fprintf('    Global softMed: %.0f HU\n', softMed);
 
 bones = {};
 all_bone_masks = false(sz);
@@ -85,8 +73,6 @@ all_bone_masks = false(sz);
 for si = 1:numel(seeds)
     seed_ijk = seeds{si}.ijk;
     comp_mask = seeds{si}.comp_mask;
-    fprintf('    Bone %d: seed [%d %d %d]...\n', si, seed_ijk);
-
     % === LOCAL CROP around source component + margin ===
     margin_mm = 10.0;
     margin_vox = ceil(margin_mm ./ spacing);
@@ -94,8 +80,6 @@ for si = 1:numel(seeds)
     r1 = max(1, min(ri) - margin_vox(1));  r2 = min(sz(1), max(ri) + margin_vox(1));
     c1 = max(1, min(ci) - margin_vox(2));  c2 = min(sz(2), max(ci) + margin_vox(2));
     s1 = max(1, min(si_idx) - margin_vox(3)); s2 = min(sz(3), max(si_idx) + margin_vox(3));
-    fprintf('      Local ROI: [%d:%d, %d:%d, %d:%d] = %dx%dx%d\n', ...
-        r1, r2, c1, c2, s1, s2, r2-r1+1, c2-c1+1, s2-s1+1);
 
     % Extract local volumes
     vol_L = vol(r1:r2, c1:c2, s1:s2);
@@ -119,8 +103,6 @@ for si = 1:numel(seeds)
         mu1 = vol_L(seed_local(1), seed_local(2), seed_local(3));
         s1_stat = 50;
     end
-    fprintf('      Seed stats: mu1=%.0f, s1=%.0f (from %d component voxels)\n', ...
-        mu1, s1_stat, numel(comp_vals));
 
     % === Scaphoid-style allow region: core -> allow -> imreconstruct ===
     G_L = imgradient3(vol_L);
@@ -158,8 +140,6 @@ for si = 1:numel(seeds)
     end
     % Exclude markers and already-assigned bones from allow
     allow_L = allow_L & ~mk_L & ~lead_L & ~all_L;
-    fprintf('      Allow region: core=%d, allow=%d, marker_buffer=%d voxels\n', ...
-        nnz(core_L), nnz(allow_L), nnz(near_marker_L));
 
     % Build FMM weight map
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
@@ -173,20 +153,14 @@ for si = 1:numel(seeds)
     W_L = min(max((W_L - Lo) / max(eps, Hi - Lo), 0), 1);
     W_L = max(W_L, eps);
 
-    fprintf('      W range: [%.4f, %.4f]\n', min(W_L(:)), max(W_L(:)));
-
     % Run FMM
     th0 = min(max(0.01, mean(W_L(seedMask_L)) * 0.5), 0.99);
-    fprintf('      FMM th0: %.4f\n', th0);
 
     try
         [~, D_L] = imsegfmm(W_L, seedMask_L, th0);
     catch ME
-        fprintf('      FMM failed: %s — skipping\n', ME.message);
         continue;
     end
-
-    fprintf('      FMM D range: [%.4f, %.4f]\n', min(D_L(:)), max(D_L(:)));
 
     % Non-air local specimen
     specimen_L = vol_L > -500;
@@ -196,11 +170,8 @@ for si = 1:numel(seeds)
     mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L);
 
     if ~any(mask_bone_L(:))
-        fprintf('      -> empty after threshold sweep, skipped\n');
         continue;
     end
-    fprintf('      After threshold: %d voxels (%.0f mm^3)\n', ...
-        nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Constrain to allow region (no marker/metal/assigned leakage)
     mask_bone_L = mask_bone_L & allow_L;
@@ -209,7 +180,6 @@ for si = 1:numel(seeds)
     mask_bone_L = seal_outer_shell(mask_bone_L, spacing);
 
     if ~any(mask_bone_L(:))
-        fprintf('      -> empty after shell sealing, skipped\n');
         continue;
     end
 
@@ -232,7 +202,6 @@ for si = 1:numel(seeds)
     else
         local_softMed = softMed;
     end
-    fprintf('      Local softMed: %.0f HU (global: %.0f)\n', local_softMed, softMed);
     mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed);
 
     % Remove small disconnected blobs using 6-connectivity (face-touching
@@ -243,21 +212,11 @@ for si = 1:numel(seeds)
     mask_bone_L = keep_largest_3d(mask_bone_L);
 
     if ~any(mask_bone_L(:))
-        fprintf('      -> empty after marker carve, skipped\n');
         continue;
     end
 
     % Surface tissue scrub: remove low-density voxels clinging to surface
-    n_before_scrub = nnz(mask_bone_L);
     mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing);
-    n_after_scrub = nnz(mask_bone_L);
-    if n_after_scrub < n_before_scrub
-        fprintf('      Surface scrub: removed %d voxels (%.0f mm^3)\n', ...
-            n_before_scrub - n_after_scrub, (n_before_scrub - n_after_scrub)*voxel_vol);
-    end
-
-    fprintf('      After seal+carve: %d voxels (%.0f mm^3)\n', ...
-        nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Paste back to full volume
     mask_bone = false(sz);
@@ -265,7 +224,6 @@ for si = 1:numel(seeds)
 
     bone_vol = sum(mask_bone(:)) * voxel_vol;
     if bone_vol < opts.MinBoneVolMM3
-        fprintf('      -> too small after post-processing (%.0f mm^3), skipped\n', bone_vol);
         continue;
     end
 
@@ -296,8 +254,7 @@ for si = 1:numel(seeds)
     bone_info.tag_dist = Inf;
 
     bones{end+1} = bone_info; %#ok<AGROW>
-    fprintf('      Final: %.0f mm^3, mean HU %.0f, dense %.0f%%\n', ...
-        bone_vol, bone_hu, bone_info.dense_fraction*100);
+    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f\n', si, bone_vol, bone_hu);
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
@@ -306,18 +263,11 @@ n_before = numel(bones);
 keep = true(1, numel(bones));
 for bi = 1:numel(bones)
     if bones{bi}.mean_hu < MIN_BONE_HU
-        fprintf('    Rejecting bone %d: mean HU %.0f < %d (not bone tissue)\n', ...
-            bi, bones{bi}.mean_hu, MIN_BONE_HU);
         keep(bi) = false;
     end
 end
 bones = bones(keep);
-if numel(bones) < n_before
-    fprintf('    Rejected %d non-bone objects\n', n_before - numel(bones));
-end
-
-% ---- Stage 5: Tag association ----
-fprintf('  [Separate] Stage 5: Tag association...\n');
+% ---- Stage 4: Tag association ----
 bones = associate_tags(bones, real_tags, spacing);
 
 % Sort by volume (largest first)
@@ -327,17 +277,6 @@ if ~isempty(bones)
     bones = bones(order);
 end
 
-fprintf('\n  Found %d bones and %d markers\n', numel(bones), numel(real_tags));
-for i = 1:numel(bones)
-    b = bones{i};
-    if ~isempty(b.tag_id)
-        tag_str = sprintf('marker %d (%.1f mm)', b.tag_id, b.tag_dist);
-    else
-        tag_str = 'no marker';
-    end
-    fprintf('    Bone %d: %.1f mm^3, mean HU %.0f, %s\n', ...
-        i, b.volume_mm3, b.mean_hu, tag_str);
-end
 
 % Specimen mask for output
 specimen = build_specimen_mask(vol, spacing);
@@ -371,7 +310,6 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     bw = bwareaopen(bw, max(200, round(min_vol_mm3 / voxel_vol)));
 
     CC = bwconncomp(bw, 26);
-    fprintf('    Initial components (after marker exclusion): %d\n', CC.NumObjects);
     if CC.NumObjects == 0
         seeds = {};
         return;
@@ -384,7 +322,6 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     MERGE_DIST_MM = 5.0;
     merge_dist_vox = MERGE_DIST_MM / mean(spacing);
     merged = merge_nearby_components(CC, sz, merge_dist_vox);
-    fprintf('    After merging nearby fragments: %d components\n', merged.NumObjects);
 
     CC = merged;
 
@@ -420,8 +357,6 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
             scores(n) = log1p(V_vox);
         end
 
-        fprintf('      Component %d: %.0f mm^3, mean HU %.0f, score %.2f\n', ...
-            n, comp_vols(n), comp_mean_hus(n), scores(n));
     end
 
     % Sort by score descending
@@ -436,7 +371,6 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
 
         % Reject air pockets (mean HU < 50) before wasting FMM slots
         if comp_mean_hus(idx) < 50
-            fprintf('      Skipping component %d: mean HU %.0f (air pocket)\n', idx, comp_mean_hus(idx));
             continue;
         end
 
@@ -535,9 +469,6 @@ function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
 
         s = s_edge - lambda * penHU - penVol;
 
-        fprintf('        th=%.3f: %d vox, edge=%.3f, medHU=%.0f, penHU=%.3f, score=%.4f%s\n', ...
-            t, nnz(B), s_edge, medHU, penHU, s, ternary(s > best_score, ' *', ''));
-
         if s > best_score
             best_score = s;
             best_mask = B;
@@ -583,7 +514,6 @@ function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, s
         marker_core = marker_mask;
         d_mm = bwdist(marker_mask) * mean(spacing);
         artifact_w = exp(-(d_mm / sigma_mm).^2);
-        fprintf('    Marker detection: no lead found\n');
         return;
     end
 
@@ -619,8 +549,6 @@ function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, s
 
     marker_core = marker_mask & (HU > 1000);
 
-    fprintf('    Marker detection: lead=%d, grown=%d (max %.1fmm, %d steps, HU>%d), core=%d voxels\n', ...
-        nnz(lead), nnz(marker_mask), max_extent_mm, MAX_STEPS, FLAG_HU_MIN, nnz(marker_core));
 
     % Artifact weight field: Gaussian decay from marker boundary
     d_vox = bwdist(marker_mask);
@@ -635,7 +563,6 @@ end
 function bones = associate_tags(bones, tags, spacing)
     if isempty(tags) || isempty(bones), return; end
 
-    fprintf('    Tag-bone associations:\n');
     vox_mm = mean(spacing);
 
     for t = 1:numel(tags)
@@ -655,8 +582,6 @@ function bones = associate_tags(bones, tags, spacing)
         end
 
         if best_bone > 0
-            fprintf('      Marker %d -> Bone %d: %.1f mm (surface-to-surface)\n', ...
-                t, best_bone, best_dist);
             if isempty(bones{best_bone}.tag_id) || best_dist < bones{best_bone}.tag_dist
                 bones{best_bone}.tag_id = tags{t}.label;
                 bones{best_bone}.tag_dist = best_dist;
@@ -688,22 +613,16 @@ function CC_out = merge_nearby_components(CC, sz, merge_dist_vox)
         comp_vols(i) = numel(CC.PixelIdxList{i});
     end
 
-    % Print pairwise distances so we can debug merge decisions
-    fprintf('    Pairwise component distances (merge threshold: %.1f vox):\n', merge_dist_vox);
     for i = 1:n
         for j = (i+1):n
             min_d = min(dists{i}(CC.PixelIdxList{j}));
-            merged_str = '';
             if min_d <= merge_dist_vox
-                merged_str = ' -> MERGE';
                 ri = i; while parent(ri) ~= ri, ri = parent(ri); end
                 rj = j; while parent(rj) ~= rj, rj = parent(rj); end
                 if ri ~= rj
                     parent(rj) = ri;
                 end
             end
-            fprintf('      C%d (%d vox) <-> C%d (%d vox): %.1f vox%s\n', ...
-                i, comp_vols(i), j, comp_vols(j), min_d, merged_str);
         end
     end
 
