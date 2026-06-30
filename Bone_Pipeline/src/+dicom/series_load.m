@@ -99,7 +99,8 @@ end
 %  MANUAL STACK READ
 % =========================================================================
 function [V, infosCell] = read_stack(filesList)
-    meta = struct('fname', [], 'InstanceNumber', [], 'IPP', [], 'IOP', []);
+    meta = struct('fname', [], 'InstanceNumber', [], 'IPP', [], 'IOP', [], ...
+                  'Rows', [], 'Cols', []);
     M = repmat(meta, 0, 1);
     for i = 1:numel(filesList)
         try
@@ -107,6 +108,8 @@ function [V, infosCell] = read_stack(filesList)
             rec.fname = filesList{i};
             rec.InstanceNumber = get_field(info, 'InstanceNumber', i);
             rec.IOP = get_field(info, 'ImageOrientationPatient', [1 0 0 0 1 0]);
+            rec.Rows = double(get_field(info, 'Rows', 0));
+            rec.Cols = double(get_field(info, 'Columns', 0));
             if isfield(info, 'ImagePositionPatient')
                 rec.IPP = double(info.ImagePositionPatient(:)).';
             else
@@ -117,6 +120,19 @@ function [V, infosCell] = read_stack(filesList)
         end
     end
     if isempty(M), error('No readable DICOM headers.'); end
+
+    % Filter to the most common image dimensions (handles multi-series folders)
+    dims = arrayfun(@(m) [m.Rows, m.Cols], M, 'UniformOutput', false);
+    dimStrs = cellfun(@mat2str, dims, 'UniformOutput', false);
+    [uDims, ~, ic] = unique(dimStrs);
+    counts = accumarray(ic, 1);
+    [~, bestIdx] = max(counts);
+    keep = ic == bestIdx;
+    if sum(keep) < numel(M)
+        fprintf('[Load] Filtered %d/%d slices to dominant size %s\n', ...
+            sum(keep), numel(M), uDims{bestIdx});
+    end
+    M = M(keep);
 
     % Sort by slice position along the normal
     IOP0 = M(1).IOP;
@@ -133,9 +149,8 @@ function [V, infosCell] = read_stack(filesList)
     end
     M = M(ord);
 
-    info0 = dicominfo(M(1).fname);
-    R = double(get_field(info0, 'Rows', []));
-    C = double(get_field(info0, 'Columns', []));
+    R = M(1).Rows;
+    C = M(1).Cols;
     S = numel(M);
 
     infosCell = cell(S, 1);
