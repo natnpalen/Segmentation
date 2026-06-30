@@ -24,9 +24,10 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'ClosingRadiusMM'     : 3.0  (morphological closing radius)
 %   'ArtifactSigmaMM'     : 3.0  (Gaussian falloff for artifact weighting)
 %   'RefineBones'         : false (run per-bone FMM refinement)
+%   'PackSpecimens'       : true (run specimen packing — slow)
 %   'PackingOrientations' : 6    (number of orientations per shape)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
-%   'SaveOutputs'         : true (export MAT, NIfTI, STL files — slow)
+%   'SaveOutputs'         : true (export MAT, NIfTI, STL files)
 %   'OutputDir'           : ''   (auto-create if empty)
 %   'ShowViewer'          : true (show 3D visualization)
 
@@ -45,6 +46,7 @@ opts = struct( ...
     'ArtifactSigmaMM',     3.0, ...
     'MarkerRangeHU',       [200 700], ...
     'RefineBones',         false, ...
+    'PackSpecimens',       true, ...
     'PackingOrientations', 6, ...
     'PackingMinDepthMM',   0.5, ...
     'SaveOutputs',         true, ...
@@ -129,6 +131,10 @@ end
 fprintf(' done (%.1fs)%s\n\n', toc(t4), ternary(use_parallel, ' [parallel]', ''));
 
 % ==== Stage 5: Specimen Packing ====
+pack_results = cell(1, n_bones);
+if ~opts.PackSpecimens
+    fprintf('[5/7] Specimen packing skipped (PackSpecimens=false)\n\n');
+else
 stl_names = {'Bend', 'Compression', 'Punch', 'Shear'};
 stl_paths = {};
 stl_found = {};
@@ -144,7 +150,6 @@ for si = 1:numel(stl_names)
     end
 end
 
-pack_results = cell(1, n_bones);
 if isempty(stl_paths)
     fprintf('[5/7] Specimen packing skipped (no STL files found)\n\n');
 else
@@ -182,6 +187,7 @@ else
         end
     end
     fprintf(' done (%.1fs)%s\n\n', toc(t5), ternary(use_parallel, ' [parallel]', ''));
+end
 end
 
 % ==== Stage 6: Visualization ====

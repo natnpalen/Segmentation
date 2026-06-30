@@ -29,6 +29,11 @@ end
 thisDir = fileparts(mfilename('fullpath'));
 addpath(thisDir);
 
+% ---- Options ----
+% Set PackSpecimens to false to skip the slow packing stage
+% Set SaveOutputs to false to skip exporting MAT/NIfTI/STL files
+
 % ---- Run ----
 out = run_bone_pipeline(dicomFolder, stlFolder, ...
-    'SaveOutputs', true);
+    'PackSpecimens', true, ...
+    'SaveOutputs',   true);
