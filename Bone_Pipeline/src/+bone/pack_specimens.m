@@ -1,8 +1,8 @@
-function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_paths, shape_names, opts, bone_axis)
+function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_paths, shape_names, opts, bone_axis, bone_idx)
 % PACK_SPECIMENS  Pack mechanical test specimens into bone regions.
 %
 %   pack_result = bone.pack_specimens(bone_mask, cortical, cancellous, ds, ...
-%       stl_paths, shape_names, opts, bone_axis)
+%       stl_paths, shape_names, opts, bone_axis, bone_idx)
 %
 % When opts.PackWholeBone is true, packs into the full bone mask as a single
 % region (ignoring cortical/cancellous boundaries). Otherwise packs cortical
@@ -12,6 +12,9 @@ function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_p
 % voxelizes the rotated mesh. Crops regions to their bounding box before
 % convolution for speed, then maps results back to full-volume coordinates.
 
+if nargin < 9, bone_idx = 0; end
+tag = sprintf('Bone #%d', bone_idx);
+
 spacing = ds.spacing;
 vol = double(ds.HU);
 voxel_vol = prod(spacing);
@@ -19,16 +22,15 @@ n_shapes = numel(stl_paths);
 
 cort_vol = sum(cortical(:)) * voxel_vol;
 canc_vol = sum(cancellous(:)) * voxel_vol;
-% Region volumes stored in result struct
 
 % ---- Load STL meshes and build rotated templates ----
-% Load and voxelize specimen meshes at bone-aligned orientations
+fprintf('       [%s] Building templates (%d shapes x %d orientations)...\n', ...
+    tag, n_shapes, opts.PackingOrientations);
 rotations = generate_bone_aligned_rotations(bone_axis, opts.PackingOrientations);
 n_orient = size(rotations, 3);
 
 templates = {};
 for si = 1:n_shapes
-    % Load shape si
     try
         TR = stlread(stl_paths{si});
         V_raw = double(TR.Points);
@@ -36,7 +38,6 @@ for si = 1:n_shapes
         V_raw = V_raw - mean(V_raw, 1);
         bbox_mm = max(V_raw, [], 1) - min(V_raw, [], 1);
     catch
-        % STL read failed — skip this shape
         continue;
     end
 
@@ -62,9 +63,13 @@ for si = 1:n_shapes
         templates{end+1} = tpl; %#ok<AGROW>
         n_valid = n_valid + 1;
     end
+    fprintf('       [%s] %s: %d/%d orientations voxelized (%.0f mm3 each)\n', ...
+        tag, shape_names{si}, n_valid, n_orient, ...
+        ternary(n_valid > 0, templates{end}.volume_mm3, 0));
 end
 
 if isempty(templates)
+    fprintf('       [%s] No valid templates — skipping\n', tag);
     pack_result = empty_result();
     return;
 end
@@ -73,7 +78,10 @@ end
 whole_bone_mode = isfield(opts, 'PackWholeBone') && opts.PackWholeBone;
 
 if whole_bone_mode
-    whole_placements = pack_region(bone_mask, templates, vol, spacing, shape_names, n_shapes);
+    region_vol = sum(bone_mask(:)) * voxel_vol;
+    fprintf('       [%s] Packing whole bone (%.0f mm3)...\n', tag, region_vol);
+    whole_placements = pack_region(bone_mask, templates, vol, spacing, shape_names, n_shapes, tag, 'whole');
+    fprintf('       [%s] Placed %d specimens (whole bone)\n', tag, numel(whole_placements));
 
     pack_result = struct();
     pack_result.whole_bone = true;
@@ -91,8 +99,12 @@ if whole_bone_mode
         pack_result.summary.(shape_names{si}) = struct('cortical', 0, 'cancellous', 0, 'whole', n_w);
     end
 else
-    cort_placements = pack_region(cortical, templates, vol, spacing, shape_names, n_shapes);
-    canc_placements = pack_region(cancellous, templates, vol, spacing, shape_names, n_shapes);
+    fprintf('       [%s] Packing cortical (%.0f mm3)...\n', tag, cort_vol);
+    cort_placements = pack_region(cortical, templates, vol, spacing, shape_names, n_shapes, tag, 'cortical');
+    fprintf('       [%s] Packing cancellous (%.0f mm3)...\n', tag, canc_vol);
+    canc_placements = pack_region(cancellous, templates, vol, spacing, shape_names, n_shapes, tag, 'cancellous');
+    fprintf('       [%s] Placed %d cortical + %d cancellous\n', tag, ...
+        numel(cort_placements), numel(canc_placements));
 
     pack_result = struct();
     pack_result.whole_bone = false;
@@ -188,7 +200,7 @@ end
 % =========================================================================
 %  REGION PACKING (with bounding-box crop for speed)
 % =========================================================================
-function placements = pack_region(region, templates, vol, spacing, shape_names, n_shapes)
+function placements = pack_region(region, templates, vol, spacing, shape_names, n_shapes, tag, region_label)
 
     voxel_vol = prod(spacing);
     region_vol = sum(region(:)) * voxel_vol;
@@ -197,6 +209,7 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
         'vertices_mm', {}, 'faces', {});
 
     if region_vol < 1.0
+        fprintf('       [%s] %s region too small (%.0f mm3) — skipping\n', tag, region_label, region_vol);
         return;
     end
 
@@ -207,9 +220,14 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
         type_idx = find(cellfun(@(t) t.shape_idx == si, templates));
         if isempty(type_idx), continue; end
 
-        [p, available] = try_place_best(available, templates(type_idx), vol, spacing);
+        [p, available, best_fit] = try_place_best(available, templates(type_idx), vol, spacing);
         if ~isempty(p)
             placements(end+1) = p; %#ok<AGROW>
+            fprintf('       [%s] Placed %s in %s (%.0f mm3, HU %.0f)\n', ...
+                tag, p.shape_name, region_label, p.volume_mm3, p.mean_hu);
+        else
+            fprintf('       [%s] %s does not fit in %s (best overlap %.0f%%)\n', ...
+                tag, shape_names{si}, region_label, best_fit * 100);
         end
     end
 
@@ -222,6 +240,8 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
         if isempty(p), break; end
 
         placements(end+1) = p; %#ok<AGROW>
+        fprintf('       [%s] Placed %s in %s (%.0f mm3, HU %.0f) [greedy #%d]\n', ...
+            tag, p.shape_name, region_label, p.volume_mm3, p.mean_hu, attempt);
     end
 end
 
@@ -229,12 +249,13 @@ end
 % =========================================================================
 %  PLACEMENT SEARCH (convolution on cropped ROI for speed)
 % =========================================================================
-function [placement, available] = try_place_best(available, templates, vol, spacing)
+function [placement, available, best_fit_frac] = try_place_best(available, templates, vol, spacing)
 
     placement = [];
     best_score = -Inf;
     best_pos = [];
     best_tpl = [];
+    best_fit_frac = 0;
 
     full_sz = size(available);
 
@@ -271,6 +292,12 @@ function [placement, available] = try_place_best(available, templates, vol, spac
         overlap_count = convn(single(avail_crop), flip_3d(single(tpl.mask)), 'valid');
         fit_frac = overlap_count / max(1, n_template_vox);
 
+        % Track best fit fraction across all templates (for diagnostics)
+        max_fit_this = max(fit_frac(:));
+        if max_fit_this > best_fit_frac
+            best_fit_frac = max_fit_this;
+        end
+
         good_fit = fit_frac >= 0.95;
         if ~any(good_fit(:)), continue; end
 
@@ -284,7 +311,6 @@ function [placement, available] = try_place_best(available, templates, vol, spac
         if local_best > best_score
             [pr, pc, ps] = ind2sub(size(score_map), linear_idx);
             best_score = local_best;
-            % Map crop position back to full volume coordinates
             best_pos = [pr + roi_min(1) - 1, pc + roi_min(2) - 1, ps + roi_min(3) - 1];
             best_tpl = tpl;
         end
