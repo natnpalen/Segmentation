@@ -151,7 +151,11 @@ if has_pack
         catch, end
 
         pr = pack_results{bi};
-        all_placements = [pr.cortical_placements, pr.cancellous_placements];
+        if isfield(pr, 'whole_bone') && pr.whole_bone
+            all_placements = pr.whole_placements;
+        else
+            all_placements = [pr.cortical_placements, pr.cancellous_placements];
+        end
 
         for pi = 1:numel(all_placements)
             p = all_placements(pi);

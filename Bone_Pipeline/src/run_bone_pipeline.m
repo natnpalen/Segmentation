@@ -22,8 +22,9 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'MinBoneVolMM3'       : 500  (minimum bone component volume)
 %   'ClosingRadiusMM'     : 3.0  (morphological closing radius)
 %   'ArtifactSigmaMM'     : 3.0  (Gaussian falloff for artifact weighting)
-%   'PackSpecimens'       : true (run specimen packing — slow)
-%   'PackingOrientations' : 6    (number of orientations per shape)
+%   'PackSpecimens'       : true  (run specimen packing — slow)
+%   'PackWholeBone'       : false (pack into full bone ignoring cortical/cancellous)
+%   'PackingOrientations' : 6     (number of orientations per shape)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
 %   'SaveOutputs'         : true (export MAT, NIfTI, STL files)
 %   'OutputDir'           : ''   (auto-create if empty)
@@ -37,6 +38,7 @@ opts = struct( ...
     'ArtifactSigmaMM',     3.0, ...
     'MarkerRangeHU',       [200 700], ...
     'PackSpecimens',       true, ...
+    'PackWholeBone',       false, ...
     'PackingOrientations', 6, ...
     'PackingMinDepthMM',   0.5, ...
     'SaveOutputs',         true, ...
@@ -128,7 +130,11 @@ else
     if isempty(stl_paths)
         fprintf('[4/6] Specimen packing skipped (no STL files found)\n\n');
     else
-        fprintf('[4/6] Packing specimens (%s)...', strjoin(stl_found, ', '));
+        if opts.PackWholeBone
+            fprintf('[4/6] Packing specimens — whole bone (%s)...', strjoin(stl_found, ', '));
+        else
+            fprintf('[4/6] Packing specimens — cortical/cancellous (%s)...', strjoin(stl_found, ', '));
+        end
         t4 = tic;
 
         bone_axes = cell(1, n_bones);
@@ -339,19 +345,36 @@ fprintf('  %-6s  %8.0f mm3  %8s  %8s  %8.0f mm3  %8.0f mm3  %6.1f%%\n', ...
 has_packing = ~isempty(pack_results) && ~isempty(pack_results{1}) && ...
     isstruct(pack_results{1}) && isfield(pack_results{1}, 'n_total');
 if has_packing
-    fprintf('\n  %-6s  %8s  %8s  %8s\n', 'Bone', 'Cortical', 'Cancel.', 'Total');
-    fprintf('  %-6s  %8s  %8s  %8s\n', '------', '--------', '--------', '--------');
+    is_whole = isfield(pack_results{1}, 'whole_bone') && pack_results{1}.whole_bone;
 
-    grand_cort = 0; grand_canc = 0;
-    for bi = 1:n_bones
-        pr = pack_results{bi};
-        grand_cort = grand_cort + pr.n_cortical;
-        grand_canc = grand_canc + pr.n_cancellous;
-        fprintf('  %-6s  %8d  %8d  %8d\n', sprintf('#%d', bi), ...
-            pr.n_cortical, pr.n_cancellous, pr.n_total);
+    if is_whole
+        fprintf('\n  Packing mode: whole bone\n');
+        fprintf('  %-6s  %8s  %8s\n', 'Bone', 'Placed', 'Total');
+        fprintf('  %-6s  %8s  %8s\n', '------', '--------', '--------');
+
+        grand_total = 0;
+        for bi = 1:n_bones
+            pr = pack_results{bi};
+            grand_total = grand_total + pr.n_total;
+            fprintf('  %-6s  %8d  %8d\n', sprintf('#%d', bi), pr.n_whole, pr.n_total);
+        end
+        fprintf('  %-6s  %8d  %8d\n', 'TOTAL', grand_total, grand_total);
+    else
+        fprintf('\n  Packing mode: cortical / cancellous\n');
+        fprintf('  %-6s  %8s  %8s  %8s\n', 'Bone', 'Cortical', 'Cancel.', 'Total');
+        fprintf('  %-6s  %8s  %8s  %8s\n', '------', '--------', '--------', '--------');
+
+        grand_cort = 0; grand_canc = 0;
+        for bi = 1:n_bones
+            pr = pack_results{bi};
+            grand_cort = grand_cort + pr.n_cortical;
+            grand_canc = grand_canc + pr.n_cancellous;
+            fprintf('  %-6s  %8d  %8d  %8d\n', sprintf('#%d', bi), ...
+                pr.n_cortical, pr.n_cancellous, pr.n_total);
+        end
+        fprintf('  %-6s  %8d  %8d  %8d\n', 'TOTAL', ...
+            grand_cort, grand_canc, grand_cort + grand_canc);
     end
-    fprintf('  %-6s  %8d  %8d  %8d\n', 'TOTAL', ...
-        grand_cort, grand_canc, grand_cort + grand_canc);
 
     % Per-type breakdown
     if isfield(pack_results{1}, 'summary')
@@ -362,7 +385,7 @@ if has_packing
             for bi = 1:n_bones
                 if isfield(pack_results{bi}.summary, all_types{ti})
                     s = pack_results{bi}.summary.(all_types{ti});
-                    type_total = type_total + s.cortical + s.cancellous;
+                    type_total = type_total + s.cortical + s.cancellous + s.whole;
                 end
             end
             fprintf('    %-15s : %d\n', all_types{ti}, type_total);
@@ -437,18 +460,27 @@ function write_summary_file(filepath, ds, sep_result, seg_results, pack_results,
     has_packing = ~isempty(pack_results) && ~isempty(pack_results{1}) && ...
         isstruct(pack_results{1}) && isfield(pack_results{1}, 'n_total');
     if has_packing
-        fprintf(fid, '\nSPECIMEN PACKING\n');
+        is_whole = isfield(pack_results{1}, 'whole_bone') && pack_results{1}.whole_bone;
+        fprintf(fid, '\nSPECIMEN PACKING (%s)\n', ternary(is_whole, 'whole bone', 'cortical/cancellous'));
         fprintf(fid, '================\n');
         for bi = 1:n_bones
             pr = pack_results{bi};
-            fprintf(fid, 'Bone %d: %d cortical + %d cancellous = %d specimens\n', ...
-                bi, pr.n_cortical, pr.n_cancellous, pr.n_total);
+            if is_whole
+                fprintf(fid, 'Bone %d: %d specimens (whole bone)\n', bi, pr.n_total);
+            else
+                fprintf(fid, 'Bone %d: %d cortical + %d cancellous = %d specimens\n', ...
+                    bi, pr.n_cortical, pr.n_cancellous, pr.n_total);
+            end
             if isfield(pr, 'summary')
                 fnames = fieldnames(pr.summary);
                 for fi = 1:numel(fnames)
                     s = pr.summary.(fnames{fi});
-                    fprintf(fid, '  %-15s: %d cortical, %d cancellous\n', ...
-                        fnames{fi}, s.cortical, s.cancellous);
+                    if is_whole
+                        fprintf(fid, '  %-15s: %d\n', fnames{fi}, s.whole);
+                    else
+                        fprintf(fid, '  %-15s: %d cortical, %d cancellous\n', ...
+                            fnames{fi}, s.cortical, s.cancellous);
+                    end
                 end
             end
         end

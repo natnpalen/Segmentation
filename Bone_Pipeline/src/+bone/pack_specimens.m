@@ -1,8 +1,12 @@
 function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_paths, shape_names, opts, bone_axis)
-% PACK_SPECIMENS  Pack mechanical test specimens into cortical and cancellous regions.
+% PACK_SPECIMENS  Pack mechanical test specimens into bone regions.
 %
 %   pack_result = bone.pack_specimens(bone_mask, cortical, cancellous, ds, ...
 %       stl_paths, shape_names, opts, bone_axis)
+%
+% When opts.PackWholeBone is true, packs into the full bone mask as a single
+% region (ignoring cortical/cancellous boundaries). Otherwise packs cortical
+% and cancellous regions separately.
 %
 % Uses true mesh geometry for fitting: rotates STL vertices first, then
 % voxelizes the rotated mesh. Crops regions to their bounding box before
@@ -66,22 +70,46 @@ if isempty(templates)
 end
 
 % ---- Pack each region ----
-cort_placements = pack_region(cortical, templates, vol, spacing, shape_names, n_shapes);
-canc_placements = pack_region(cancellous, templates, vol, spacing, shape_names, n_shapes);
+whole_bone_mode = isfield(opts, 'PackWholeBone') && opts.PackWholeBone;
 
-% ---- Build result ----
-pack_result = struct();
-pack_result.cortical_placements = cort_placements;
-pack_result.cancellous_placements = canc_placements;
-pack_result.n_cortical = numel(cort_placements);
-pack_result.n_cancellous = numel(canc_placements);
-pack_result.n_total = numel(cort_placements) + numel(canc_placements);
+if whole_bone_mode
+    whole_placements = pack_region(bone_mask, templates, vol, spacing, shape_names, n_shapes);
 
-pack_result.summary = struct();
-for si = 1:n_shapes
-    n_cort = sum(arrayfun(@(p) p.shape_idx == si, cort_placements));
-    n_canc = sum(arrayfun(@(p) p.shape_idx == si, canc_placements));
-    pack_result.summary.(shape_names{si}) = struct('cortical', n_cort, 'cancellous', n_canc);
+    pack_result = struct();
+    pack_result.whole_bone = true;
+    pack_result.whole_placements = whole_placements;
+    pack_result.cortical_placements = empty_placements();
+    pack_result.cancellous_placements = empty_placements();
+    pack_result.n_whole = numel(whole_placements);
+    pack_result.n_cortical = 0;
+    pack_result.n_cancellous = 0;
+    pack_result.n_total = numel(whole_placements);
+
+    pack_result.summary = struct();
+    for si = 1:n_shapes
+        n_w = sum(arrayfun(@(p) p.shape_idx == si, whole_placements));
+        pack_result.summary.(shape_names{si}) = struct('cortical', 0, 'cancellous', 0, 'whole', n_w);
+    end
+else
+    cort_placements = pack_region(cortical, templates, vol, spacing, shape_names, n_shapes);
+    canc_placements = pack_region(cancellous, templates, vol, spacing, shape_names, n_shapes);
+
+    pack_result = struct();
+    pack_result.whole_bone = false;
+    pack_result.whole_placements = empty_placements();
+    pack_result.cortical_placements = cort_placements;
+    pack_result.cancellous_placements = canc_placements;
+    pack_result.n_whole = 0;
+    pack_result.n_cortical = numel(cort_placements);
+    pack_result.n_cancellous = numel(canc_placements);
+    pack_result.n_total = numel(cort_placements) + numel(canc_placements);
+
+    pack_result.summary = struct();
+    for si = 1:n_shapes
+        n_cort = sum(arrayfun(@(p) p.shape_idx == si, cort_placements));
+        n_canc = sum(arrayfun(@(p) p.shape_idx == si, canc_placements));
+        pack_result.summary.(shape_names{si}) = struct('cortical', n_cort, 'cancellous', n_canc, 'whole', 0);
+    end
 end
 end
 
@@ -404,14 +432,21 @@ end
 % =========================================================================
 function r = empty_result()
     r = struct();
-    r.cortical_placements = struct('shape_name', {}, 'shape_idx', {}, ...
-        'orientation', {}, 'position_vox', {}, 'volume_mm3', {}, ...
-        'mean_hu', {}, 'vertices_mm', {}, 'faces', {});
-    r.cancellous_placements = r.cortical_placements;
+    r.whole_bone = false;
+    r.whole_placements = empty_placements();
+    r.cortical_placements = empty_placements();
+    r.cancellous_placements = empty_placements();
+    r.n_whole = 0;
     r.n_cortical = 0;
     r.n_cancellous = 0;
     r.n_total = 0;
     r.summary = struct();
+end
+
+function p = empty_placements()
+    p = struct('shape_name', {}, 'shape_idx', {}, ...
+        'orientation', {}, 'position_vox', {}, 'volume_mm3', {}, ...
+        'mean_hu', {}, 'vertices_mm', {}, 'faces', {});
 end
 
 function s = ternary(cond, a, b)

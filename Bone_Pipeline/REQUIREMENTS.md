@@ -138,6 +138,7 @@ Set these as name-value pairs in the `run_bone_pipeline()` call inside `run_scan
 | Option | Default | Description |
 |--------|---------|-------------|
 | `PackSpecimens` | `true` | Run specimen packing stage (slow — disable for faster runs) |
+| `PackWholeBone` | `false` | Pack into the full bone volume as one region, ignoring cortical/cancellous boundaries |
 | `SaveOutputs` | `true` | Export MAT, NIfTI, and STL files |
 | `ShowViewer` | `true` | Show interactive 3D visualization figures |
 | `PackingOrientations` | `6` | Number of rotations to try per specimen shape |
