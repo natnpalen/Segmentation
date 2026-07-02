@@ -131,11 +131,49 @@ else
         fprintf('[4/6] Specimen packing skipped (no STL files found)\n\n');
     else
         if opts.PackWholeBone
-            fprintf('[4/6] Packing specimens — whole bone (%s)...', strjoin(stl_found, ', '));
+            fprintf('[4/6] Packing specimens — whole bone (%s)\n', strjoin(stl_found, ', '));
         else
-            fprintf('[4/6] Packing specimens — cortical/cancellous (%s)...', strjoin(stl_found, ', '));
+            fprintf('[4/6] Packing specimens — cortical/cancellous (%s)\n', strjoin(stl_found, ', '));
         end
         t4 = tic;
+
+        % Print specimen dimensions (load once for display)
+        fprintf('       Specimen dimensions:\n');
+        fprintf('       %-15s  %6s x %6s x %6s  %10s\n', 'Shape', 'X mm', 'Y mm', 'Z mm', 'Volume');
+        fprintf('       %-15s  %6s   %6s   %6s  %10s\n', '---------------', '------', '------', '------', '----------');
+        for si = 1:numel(stl_paths)
+            try
+                TR = stlread(stl_paths{si});
+                V_raw = double(TR.Points);
+                V_raw = V_raw - mean(V_raw, 1);
+                bbox = max(V_raw, [], 1) - min(V_raw, [], 1);
+                % Approximate volume from convex hull
+                try
+                    [~, stl_vol] = convhull(V_raw);
+                catch
+                    stl_vol = prod(bbox);
+                end
+                fprintf('       %-15s  %5.1f  x %5.1f  x %5.1f   %7.0f mm3\n', ...
+                    stl_found{si}, bbox(1), bbox(2), bbox(3), stl_vol);
+            catch
+                fprintf('       %-15s  (failed to read)\n', stl_found{si});
+            end
+        end
+
+        % Print bone region volumes for comparison
+        fprintf('       Bone volumes:\n');
+        for bi = 1:n_bones
+            bone_vol_bi = sep_result.bones{bi}.volume_mm3;
+            if opts.PackWholeBone
+                fprintf('       Bone #%d: %.0f mm3 (whole)\n', bi, bone_vol_bi);
+            else
+                cort_v = seg_results{bi}.info.cortical_volume_mm3;
+                canc_v = seg_results{bi}.info.cancellous_volume_mm3;
+                fprintf('       Bone #%d: %.0f mm3 (cortical %.0f, cancellous %.0f)\n', ...
+                    bi, bone_vol_bi, cort_v, canc_v);
+            end
+        end
+        fprintf('\n');
 
         bone_axes = cell(1, n_bones);
         corticals = cell(1, n_bones);
@@ -158,16 +196,16 @@ else
             parfor bi = 1:n_bones
                 pack_results{bi} = bone.pack_specimens( ...
                     bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
-                    ds, stl_paths, stl_found, opts, bone_axes{bi});
+                    ds, stl_paths, stl_found, opts, bone_axes{bi}, bi);
             end
         else
             for bi = 1:n_bones
                 pack_results{bi} = bone.pack_specimens( ...
                     bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
-                    ds, stl_paths, stl_found, opts, bone_axes{bi});
+                    ds, stl_paths, stl_found, opts, bone_axes{bi}, bi);
             end
         end
-        fprintf(' done (%.1fs)%s\n\n', toc(t4), ternary(use_parallel, ' [parallel]', ''));
+        fprintf('       Done (%.1fs)%s\n\n', toc(t4), ternary(use_parallel, ' [parallel]', ''));
     end
 end
 
