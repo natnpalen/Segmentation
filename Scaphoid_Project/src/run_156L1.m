@@ -7,5 +7,5 @@
 clear all; close all; clc;
 dicomFolder = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\New Bone Scans\156L-1\DICOMOBJ';
 stlFolder   = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\Mechancial Specimens';
-
+ 
 out = run_bone_pipeline(dicomFolder, stlFolder);
