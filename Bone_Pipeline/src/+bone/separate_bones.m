@@ -230,6 +230,33 @@ for si = 1:numel(seeds)
     % Surface tissue scrub: remove low-density voxels clinging to surface
     mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing, shaved);
 
+    reclaimed_mm3 = 0;
+    if shaved
+        % Cancellous reclaim (additive only). The FMM weights are learned
+        % from the seed component — dense cortical for machined segments —
+        % so growth stops at the cortical boundary and low-HU cancellous is
+        % never claimed. Cancellous ENCLOSED by cortex gets rescued by
+        % imfill, but cancellous exposed at a machined cut face is open to
+        % air and stays out entirely. Reclaim bone-density material that is
+        % connected to the mask and within a short reach of it. This step
+        % only ever ADDS voxels; the existing mask is untouched.
+        RECLAIM_HU_MIN = 90;      % above marrow/fluid, below cancellous struts
+        RECLAIM_REACH_MM = 4.0;   % medullary canal radius scale
+        d_mask_L = bwdist(mask_bone_L) * mean(spacing);
+        reclaim_cand = (vol_L > RECLAIM_HU_MIN) & (d_mask_L < RECLAIM_REACH_MM) & ...
+            ~mk_L & ~lead_L & ~all_L & ~near_marker_L;
+        reclaim_cand = reclaim_cand | mask_bone_L;
+        reclaimed = imreconstruct(mask_bone_L, reclaim_cand);
+        % Close over marrow pores inside the reclaimed cancellous and fill
+        % the enclosed ones
+        reclaimed = imclose(reclaimed, strel('sphere', 1));
+        reclaimed = imfill(reclaimed, 'holes');
+        reclaimed = reclaimed & ~mk_L & ~lead_L & ~all_L;
+        reclaimed = keep_largest_3d(reclaimed | mask_bone_L);
+        reclaimed_mm3 = (nnz(reclaimed) - nnz(mask_bone_L)) * voxel_vol;
+        mask_bone_L = reclaimed;
+    end
+
     % Coverage diagnostic: bone-like material (>150 HU) within ~1mm of the
     % final mask but not included in it. A large value means the boundary
     % cleanup dropped real bone (e.g. exposed cancellous on cut faces).
@@ -273,10 +300,11 @@ for si = 1:numel(seeds)
     bone_info.tag_id = [];
     bone_info.tag_dist = Inf;
     bone_info.unclaimed_adjacent_mm3 = unclaimed_mm3;
+    bone_info.reclaimed_cancellous_mm3 = reclaimed_mm3;
 
     bones{end+1} = bone_info; %#ok<AGROW>
-    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f  (unclaimed bone-like material within 1mm: %.0f mm^3)\n', ...
-        si, bone_vol, bone_hu, unclaimed_mm3);
+    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f  (reclaimed cancellous: %.0f mm^3, unclaimed within 1mm: %.0f mm^3)\n', ...
+        si, bone_vol, bone_hu, reclaimed_mm3, unclaimed_mm3);
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
