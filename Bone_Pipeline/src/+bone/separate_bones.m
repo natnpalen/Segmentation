@@ -132,6 +132,12 @@ for si = 1:numel(seeds)
 
     % Allow = moderate HU OR high gradient (catches cancellous bone)
     HU_ALLOW_MIN = max(70, min(220, softMed + 110));
+    if shaved
+        % Machined specimens: cut faces expose cancellous bone (100-300 HU)
+        % directly to air. The adaptive floor rides up on the dense cortical
+        % median and drops that exposed cancellous, so use the low floor.
+        HU_ALLOW_MIN = 70;
+    end
     gThr_L = prctile(G_L(:), 85);
     maskR_L = (vol_L > HU_ALLOW_MIN) | (G_L > gThr_L);
 
@@ -222,7 +228,15 @@ for si = 1:numel(seeds)
     end
 
     % Surface tissue scrub: remove low-density voxels clinging to surface
-    mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing);
+    mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing, shaved);
+
+    % Coverage diagnostic: bone-like material (>150 HU) within ~1mm of the
+    % final mask but not included in it. A large value means the boundary
+    % cleanup dropped real bone (e.g. exposed cancellous on cut faces).
+    halo_vox = max(1, round(1.0 / mean(spacing)));
+    halo_L = imdilate(mask_bone_L, strel('sphere', halo_vox)) & ~mask_bone_L;
+    unclaimed_L = halo_L & (vol_L > 150) & ~mk_L & ~lead_L & ~all_L;
+    unclaimed_mm3 = sum(unclaimed_L(:)) * voxel_vol;
 
     % Paste back to full volume
     mask_bone = false(sz);
@@ -258,9 +272,11 @@ for si = 1:numel(seeds)
     bone_info.bbox = bbox;
     bone_info.tag_id = [];
     bone_info.tag_dist = Inf;
+    bone_info.unclaimed_adjacent_mm3 = unclaimed_mm3;
 
     bones{end+1} = bone_info; %#ok<AGROW>
-    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f\n', si, bone_vol, bone_hu);
+    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f  (unclaimed bone-like material within 1mm: %.0f mm^3)\n', ...
+        si, bone_vol, bone_hu, unclaimed_mm3);
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
@@ -714,7 +730,13 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     core_thr = max(240, min(650, prctile(vals, 92)));
     core_seed = band & (vol > core_thr);
 
+    % In shaved mode all four surface-cleanup thresholds below use fixed
+    % low floors: machined specimens carry no clinging soft tissue, so a
+    % low-HU voxel at the boundary is exposed cancellous bone, not tissue.
+    % The adaptive formulas ride up on the dense cortical median (softMed
+    % ~800-1100 for all-cortical segments) and would carve cancellous away.
     HU_SUPPORT_MIN = max(60, min(180, softMed + 90));
+    if shaved, HU_SUPPORT_MIN = 80; end
     gThr = prctile(G(:), 80);
     support = band & ((vol > HU_SUPPORT_MIN) | (G > gThr));
 
@@ -734,6 +756,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     perim = bwperim(mask, 26);
     band1 = imdilate(perim, strel('sphere', 1));
     T_hu = max(80, min(340, softMed * 0.7));
+    if shaved, T_hu = 100; end
     T_g = prctile(G(:), 70);
     kill = band1 & (double(vol) < T_hu) & (G < T_g);
     if any(kill(:))
@@ -750,6 +773,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     outer1 = imdilate(mask, strel('sphere', 1)) & ~mask;
     protected_core = imdilate(vol > core_thr, strel('sphere', 2));
     T_lo = max(80, min(280, softMed * 0.5));
+    if shaved, T_lo = 100; end
     airNear = outer1 & imdilate(vol < -300, strel('sphere', 1));
     kill = band1 & (double(vol) < T_lo) & imdilate(airNear, strel('sphere', 1)) & ~protected_core;
     if any(kill(:))
@@ -762,6 +786,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     % --- Step 4: Final boundary carve ---
     band1 = imdilate(bwperim(mask, 26), strel('sphere', 1));
     HU_CARVE_FLOOR = max(80, min(300, softMed * 0.6));
+    if shaved, HU_CARVE_FLOOR = 100; end
     kill = band1 & (double(vol) < HU_CARVE_FLOOR);
     if any(kill(:))
         mask(kill) = false;
@@ -809,11 +834,12 @@ end
 % =========================================================================
 %  SURFACE TISSUE SCRUB
 % =========================================================================
-function mask = scrub_surface_tissue(mask, vol, spacing)
+function mask = scrub_surface_tissue(mask, vol, spacing, shaved)
 % Remove low-density surface voxels that are likely residual soft tissue.
 % Only touches the outermost shell (within 1 voxel of air). Compares
 % surface HU against the bone's interior median to identify tissue.
 
+    if nargin < 4, shaved = false; end
     if nnz(mask) < 100, return; end
 
     voxmm = mean(spacing);
@@ -838,8 +864,15 @@ function mask = scrub_surface_tissue(mask, vol, spacing)
     if ~any(surface_shell(:)), return; end
 
     % Tissue threshold: surface voxels far below interior density
-    % Use 25% of interior median, with a floor of 80 HU
-    tissue_thr = max(80, interior_med * 0.25);
+    % Use 25% of interior median, with a floor of 80 HU.
+    % Shaved mode: the interior median is cortical-dominated (~1000 HU) so
+    % the relative threshold (~250 HU) would scrub exposed cancellous off
+    % the machined cut faces — use a fixed low floor instead.
+    if shaved
+        tissue_thr = 100;
+    else
+        tissue_thr = max(80, interior_med * 0.25);
+    end
 
     % Remove surface voxels below threshold
     to_remove = surface_shell & (vol < tissue_thr);
