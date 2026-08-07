@@ -46,7 +46,7 @@ Finds and isolates each individual bone in the scan. The bones are excised (cut 
 
 1. **Find the markers** — Lead letters show up at very high HU (>3000). The pipeline finds these, then "grows" the marker mask outward to capture the attached metal flag tabs. This marker mask is used to prevent the bone segmentation from including marker material.
 
-2. **Find seed points** — The volume is thresholded to separate bone-like material from air. Connected regions are found and scored by shape (roundness, elongation) and size. Fragments split by marker exclusion are merged back together if they're within 5mm. One seed point is placed at the deepest interior point of each region.
+2. **Find seed points** — The volume is thresholded to separate bone-like material from air. Connected regions are found and scored by shape (roundness, elongation) and size. Fragments split by marker exclusion are merged back together if they're within 5mm. One seed point is placed at the deepest interior point of each region. Every candidate region is printed to the console with its volume, mean HU, dense-bone content, and — if it was rejected — the reason, so a scan that finds no bones tells you exactly which threshold to adjust. Regions with a low mean HU are only rejected if they also contain almost no dense (>250 HU) bone, so wet or tissue-covered specimens aren't discarded by their average density.
 
 3. **Grow each bone** — Starting from each seed, the bone region is expanded outward using a Fast Marching Method (FMM) — essentially a "smart flood fill" that follows bone-like densities and avoids markers and air. The growth speed is weighted by how bone-like each voxel is (based on HU) and how far it is from marker artifacts. Multiple growth thresholds are tested and the one producing the best-shaped result (scored by boundary sharpness and interior density) is kept.
 
@@ -65,6 +65,10 @@ Divides each bone into its two tissue types:
 The bone is divided along its long axis into slabs (4mm wide). Within each slab, the pipeline builds a depth-vs-density profile: starting from the bone surface and moving inward, it measures the average HU at each depth. Cortical bone shows up as a high-density layer near the surface that drops off sharply into lower-density cancellous bone. The boundary is placed at the depth where this density drop is steepest (the maximum negative gradient).
 
 Bones are classified by shape — "elongated" bones like metacarpals get a thicker cortical allowance (up to 2.5mm) while "compact" bones like carpals get a thinner one (up to 1.2mm). The transition depth is smoothed across slabs so the cortical shell varies gradually along the bone's length.
+
+Two special cases:
+- **All-cortical specimens** — machined segments cut from the shaft are almost entirely cortical bone, with no real density drop toward the interior. If the interior density comes out close to the shell density (within 65%), the whole bone is classified as cortical instead of inventing an arbitrary boundary.
+- **Turning the split off** — set `SplitCorticalCancellous = false` to skip this stage entirely. Each bone is kept as a single whole region and specimen packing automatically runs in whole-bone mode.
 
 **Output:** Cortical mask, cancellous mask, and metrics (cortical thickness, cortical fraction, bone shape classification).
 
@@ -128,11 +132,13 @@ Set these as name-value pairs in the `run_bone_pipeline()` call inside `run_scan
 |--------|---------|-------------|
 | `PackSpecimens` | `true` | Run specimen packing stage. Set to `false` to skip (saves ~30 min). |
 | `PackWholeBone` | `false` | Pack into the full bone volume as one region, ignoring cortical/cancellous boundaries. |
+| `SplitCorticalCancellous` | `true` | Set to `false` to turn off the cortical/cancellous sectioning entirely. Each bone is kept as one whole region, the cortical/cancellous NIfTI files are not written, and specimen packing automatically runs in whole-bone mode. |
+| `ShavedBoneMode` | `false` | For scans of machined specimens — e.g. metacarpals with parts of the cortical bone shaved flat for 3-point bending. Lowers the minimum bone size to 150 mm^3 (unless `MinBoneVolMM3` is set explicitly) and uses gentler surface cleanup so thin cortical plates aren't eroded away. |
 | `SaveOutputs` | `true` | Export MAT, NIfTI, and STL files. |
 | `ShowViewer` | `true` | Show interactive 3D visualization figures. |
 | `PackingOrientations` | `6` | Number of rotations to try per specimen shape. More orientations = better packing but slower. |
 | `TagHUMin` | `1200` | HU threshold for metal tag detection. |
-| `MinBoneVolMM3` | `500` | Minimum bone volume (mm^3) to keep. Objects smaller than this are discarded. |
+| `MinBoneVolMM3` | auto | Minimum bone volume (mm^3) to keep. Objects smaller than this are discarded. Defaults to 500, or 150 when `ShavedBoneMode` is on. |
 | `ClosingRadiusMM` | `3.0` | Morphological closing radius for sealing small gaps in bone masks. |
 | `ArtifactSigmaMM` | `3.0` | Controls how far the marker artifact suppression extends from each marker. |
 | `TargetIsoMM` | `[]` (off) | Resample to isotropic voxels at this spacing (mm). Leave empty to keep original spacing. |

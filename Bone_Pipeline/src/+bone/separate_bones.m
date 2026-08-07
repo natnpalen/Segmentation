@@ -19,6 +19,11 @@ spacing = ds.spacing;
 voxel_vol = prod(spacing);
 sz = size(vol);
 
+% Shaved-bone mode: machined specimens (e.g. metacarpals with cortical bone
+% shaved flat for 3-point bending) are smaller and thinner than intact
+% bones, so the size floor and surface morphology are relaxed.
+shaved = isfield(opts, 'ShavedBoneMode') && opts.ShavedBoneMode;
+
 % Hard metal mask: voxels that must NEVER be included in any bone
 lead_metal = vol > 4000;
 
@@ -49,7 +54,8 @@ end
 fprintf('    Marker assemblies: %d\n', numel(real_tags));
 
 % ---- Stage 2: Find seed points (one per bone) ----
-fprintf('  [Separate] Stage 2: Finding bone seed points...\n');
+fprintf('  [Separate] Stage 2: Finding bone seed points%s...\n', ...
+    ternary(shaved, ' (shaved-bone mode)', ''));
 seeds = find_bone_seeds(vol, marker_mask, spacing, opts.MinBoneVolMM3);
 fprintf('    Found %d seed points\n', numel(seeds));
 
@@ -202,7 +208,7 @@ for si = 1:numel(seeds)
     else
         local_softMed = softMed;
     end
-    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed);
+    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed, shaved);
 
     % Remove small disconnected blobs using 6-connectivity (face-touching
     % only). Corner-connected fragments that look disconnected in the
@@ -258,11 +264,15 @@ for si = 1:numel(seeds)
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
+% Same dense-content rescue as seed finding: a low mean HU alone does not
+% reject a bone that still contains substantial dense material.
 MIN_BONE_HU = 50;
+dense_rescue_mm3 = max(50, 0.1 * opts.MinBoneVolMM3);
 n_before = numel(bones);
 keep = true(1, numel(bones));
 for bi = 1:numel(bones)
-    if bones{bi}.mean_hu < MIN_BONE_HU
+    dense_mm3 = bones{bi}.dense_fraction * bones{bi}.volume_mm3;
+    if bones{bi}.mean_hu < MIN_BONE_HU && dense_mm3 < dense_rescue_mm3
         keep(bi) = false;
     end
 end
@@ -307,10 +317,16 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     border(:,:,[1 end]) = true;
     bw = bw & ~imdilate(border, strel('sphere', 1));
 
-    bw = bwareaopen(bw, max(200, round(min_vol_mm3 / voxel_vol)));
+    % Pre-filter only obvious specks. Components between this floor and
+    % MinBoneVolMM3 survive to the scoring loop so their rejection can be
+    % reported with a reason instead of vanishing silently.
+    speck_vox = max(200, round(0.25 * min_vol_mm3 / voxel_vol));
+    bw = bwareaopen(bw, speck_vox);
 
     CC = bwconncomp(bw, 26);
     if CC.NumObjects == 0
+        fprintf('    No candidate components above %.0f mm^3 (non-air, non-marker, non-border).\n', ...
+            speck_vox * voxel_vol);
         seeds = {};
         return;
     end
@@ -326,9 +342,11 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     CC = merged;
 
     % Score each component
+    DENSE_HU = 250;
     scores = zeros(CC.NumObjects, 1);
     comp_vols = zeros(CC.NumObjects, 1);
     comp_mean_hus = zeros(CC.NumObjects, 1);
+    comp_dense_vols = zeros(CC.NumObjects, 1);
 
     for n = 1:CC.NumObjects
         M = false(sz);
@@ -337,6 +355,7 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         comp_vols(n) = V_vox * voxel_vol;
 
         hvals = vol(CC.PixelIdxList{n});
+        comp_dense_vols(n) = sum(hvals > DENSE_HU) * voxel_vol;
         hvals_tissue = hvals(hvals > -200);
         if ~isempty(hvals_tissue)
             comp_mean_hus(n) = mean(hvals_tissue);
@@ -362,17 +381,34 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     % Sort by score descending
     [~, order] = sort(scores, 'descend');
 
+    % Dense-content rescue: a wet or tissue-covered bone can have a low
+    % component MEAN HU even though it contains plenty of dense bone, so a
+    % low mean alone is not enough to reject — the component must also lack
+    % dense (>250 HU) material.
+    dense_rescue_mm3 = max(50, 0.1 * min_vol_mm3);
+
     seeds = {};
     for k = 1:CC.NumObjects
         idx = order(k);
-        if comp_vols(idx) < min_vol_mm3
+        v_mm3 = comp_vols(idx);
+        mean_hu = comp_mean_hus(idx);
+        dense_mm3 = comp_dense_vols(idx);
+
+        if v_mm3 < min_vol_mm3
+            fprintf('    Candidate %d: %.0f mm^3, mean HU %.0f, dense %.0f mm^3 -> rejected (volume < MinBoneVolMM3 = %.0f)\n', ...
+                k, v_mm3, mean_hu, dense_mm3, min_vol_mm3);
             continue;
         end
 
-        % Reject air pockets (mean HU < 50) before wasting FMM slots
-        if comp_mean_hus(idx) < 50
+        % Reject air pockets / tissue-only blobs before wasting FMM slots
+        if mean_hu < 50 && dense_mm3 < dense_rescue_mm3
+            fprintf('    Candidate %d: %.0f mm^3, mean HU %.0f, dense %.0f mm^3 -> rejected (mean HU < 50, dense bone < %.0f mm^3)\n', ...
+                k, v_mm3, mean_hu, dense_mm3, dense_rescue_mm3);
             continue;
         end
+
+        fprintf('    Candidate %d: %.0f mm^3, mean HU %.0f, dense %.0f mm^3 -> seed\n', ...
+            k, v_mm3, mean_hu, dense_mm3);
 
         % Seed = deepest interior point of this component
         comp_mask = false(sz);
@@ -394,6 +430,11 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         seed.comp_mask = comp_mask;
         seed.max_depth_vox = max_depth;
         seeds{end+1} = seed; %#ok<AGROW>
+    end
+
+    if isempty(seeds)
+        fprintf('    All %d candidates rejected. If these are machined specimens, try ShavedBoneMode=true or lower MinBoneVolMM3 (current: %.0f mm^3).\n', ...
+            CC.NumObjects, min_vol_mm3);
     end
 end
 
@@ -655,7 +696,8 @@ end
 %  BOUNDARY REFINEMENT (ported from scaphoid cling-prune-carve chain)
 %  Protects the deep interior, aggressively cleans tissue from the surface.
 % =========================================================================
-function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed)
+function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed, shaved)
+    if nargin < 7, shaved = false; end
     if ~any(mask(:)), return; end
     voxmm = mean(spacing);
 
@@ -729,8 +771,15 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     % Opening with sphere(2) severs thin tissue bridges (~0.5mm) that
     % connect small blobs to the main bone body. The bulk bone (many mm
     % across) survives easily; only thin protrusions get pruned.
+    % Shaved specimens can be thin cortical plates that a sphere(2)
+    % opening would destroy, so use a 1-voxel opening there.
+    if shaved
+        rOpen = 1;
+    else
+        rOpen = 2;
+    end
     mask = keep_largest_3d(mask);
-    mask = imopen(mask, strel('sphere', 2));
+    mask = imopen(mask, strel('sphere', rOpen));
     mask = keep_largest_3d(mask);
     mask = imclose(mask, strel('sphere', 2));
     mask = imfill(mask, 'holes');
