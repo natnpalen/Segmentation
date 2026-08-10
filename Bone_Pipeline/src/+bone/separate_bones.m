@@ -231,6 +231,7 @@ for si = 1:numel(seeds)
     mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing, shaved);
 
     reclaimed_mm3 = 0;
+    edge_mm3 = 0;
     if shaved
         % Cancellous reclaim (additive only). The FMM weights are learned
         % from the seed component — dense cortical for machined segments —
@@ -255,6 +256,29 @@ for si = 1:numel(seeds)
         reclaimed = keep_largest_3d(reclaimed | mask_bone_L);
         reclaimed_mm3 = (nnz(reclaimed) - nnz(mask_bone_L)) * voxel_vol;
         mask_bone_L = reclaimed;
+
+        % Partial-volume edge completion (additive only). A voxel that
+        % straddles the bone-air surface averages air (-1000) with bone
+        % HU, so the outermost rind of a machined cut face reads roughly
+        % -300..+100 HU and fails every HU gate — the mask stops short of
+        % the true surface, most visibly at the short edges and corners
+        % of bending beams. HU cannot separate this rind from soft tissue
+        % (their ranges overlap), but CONTEXT can: a non-air voxel pressed
+        % directly against dense bone is interface, while soft tissue has
+        % no dense bone backing. Add the rind by adjacency: voxels that
+        % are non-air, within 2 voxels of dense (>300 HU) in-mask bone,
+        % and touching the current mask. Growth is capped by the dense
+        % envelope, so it cannot crawl along tissue.
+        PV_AIR_MAX = -200;   % >= ~40-50% bone content in the mix
+        dense_env = imdilate(mask_bone_L & (vol_L > 300), strel('sphere', 2));
+        for pv_iter = 1:2
+            rind = imdilate(mask_bone_L, strel('sphere', 1)) & ~mask_bone_L;
+            pv_add = rind & (vol_L > PV_AIR_MAX) & dense_env & ...
+                ~mk_L & ~lead_L & ~all_L & ~near_marker_L;
+            if ~any(pv_add(:)), break; end
+            mask_bone_L = mask_bone_L | pv_add;
+            edge_mm3 = edge_mm3 + nnz(pv_add) * voxel_vol;
+        end
     end
 
     % Coverage diagnostic: bone-like material (>150 HU) within ~1mm of the
@@ -301,10 +325,11 @@ for si = 1:numel(seeds)
     bone_info.tag_dist = Inf;
     bone_info.unclaimed_adjacent_mm3 = unclaimed_mm3;
     bone_info.reclaimed_cancellous_mm3 = reclaimed_mm3;
+    bone_info.edge_completion_mm3 = edge_mm3;
 
     bones{end+1} = bone_info; %#ok<AGROW>
-    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f  (reclaimed cancellous: %.0f mm^3, unclaimed within 1mm: %.0f mm^3)\n', ...
-        si, bone_vol, bone_hu, reclaimed_mm3, unclaimed_mm3);
+    fprintf('    Bone %d: %.0f mm^3, mean HU %.0f  (reclaimed cancellous: %.0f mm^3, edge rind: %.0f mm^3, unclaimed within 1mm: %.0f mm^3)\n', ...
+        si, bone_vol, bone_hu, reclaimed_mm3, edge_mm3, unclaimed_mm3);
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
