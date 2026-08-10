@@ -32,7 +32,11 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'ArtifactSigmaMM'     : 3.0  (Gaussian falloff for artifact weighting)
 %   'PackSpecimens'       : true  (run specimen packing — slow)
 %   'PackWholeBone'       : false (pack into full bone ignoring cortical/cancellous)
-%   'PackingOrientations' : 6     (number of orientations per shape)
+%   'PackingOrientations' : 6     (orientations per shape, up to 34. The
+%                                 first 8 are coarse 90-degree steps; higher
+%                                 values add 30-45 degree rolls and 15-degree
+%                                 tilts. 24+ recommended for elongated
+%                                 specimens in curved bones.)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
 %   'SaveOutputs'         : true (export MAT, NIfTI, STL files)
 %   'OutputDir'           : ''   (auto-create if empty)

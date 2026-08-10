@@ -220,23 +220,32 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
         type_idx = find(cellfun(@(t) t.shape_idx == si, templates));
         if isempty(type_idx), continue; end
 
-        [p, available, best_fit] = try_place_best(available, templates(type_idx), vol, spacing);
+        [p, available, best_fit, skip_msg] = try_place_best(available, templates(type_idx), vol, spacing);
         if ~isempty(p)
             placements(end+1) = p; %#ok<AGROW>
             fprintf('       [%s] Placed %s in %s (%.0f mm3, HU %.0f)\n', ...
                 tag, p.shape_name, region_label, p.volume_mm3, p.mean_hu);
+        elseif ~isempty(skip_msg)
+            fprintf('       [%s] %s does not fit in %s (%s)\n', ...
+                tag, shape_names{si}, region_label, skip_msg);
         else
             fprintf('       [%s] %s does not fit in %s (best overlap %.0f%%)\n', ...
                 tag, shape_names{si}, region_label, best_fit * 100);
         end
     end
 
-    % Phase 2: greedily pack more specimens
+    % Phase 2: greedily pack more specimens.
+    % The available region only ever shrinks, so a template that has no
+    % valid position now can never gain one — deactivate it permanently
+    % instead of re-evaluating it every round.
     max_additional = 50;
+    active = true(1, numel(templates));
     for attempt = 1:max_additional
-        if ~any(available(:)), break; end
+        if ~any(available(:)) || ~any(active), break; end
 
-        [p, available] = try_place_best(available, templates, vol, spacing);
+        idx_active = find(active);
+        [p, available, ~, ~, had_fit] = try_place_best(available, templates(idx_active), vol, spacing);
+        active(idx_active(~had_fit)) = false;
         if isempty(p), break; end
 
         placements(end+1) = p; %#ok<AGROW>
@@ -249,17 +258,22 @@ end
 % =========================================================================
 %  PLACEMENT SEARCH (convolution on cropped ROI for speed)
 % =========================================================================
-function [placement, available, best_fit_frac] = try_place_best(available, templates, vol, spacing)
+function [placement, available, best_fit_frac, skip_msg, had_fit] = try_place_best(available, templates, vol, spacing)
 
     placement = [];
     best_score = -Inf;
     best_pos = [];
     best_tpl = [];
     best_fit_frac = 0;
+    skip_msg = '';
+    had_fit = false(1, numel(templates));
 
     full_sz = size(available);
 
-    % Crop available region to its bounding box (with padding for templates)
+    % Crop available region to its bounding box (with padding for templates).
+    % A valid placement needs >=95% of the specimen inside the available
+    % region, so a template can only overhang the bounding box by a small
+    % fraction of its own size — a quarter-size pad is sufficient.
     max_tpl_sz = [0 0 0];
     for ti = 1:numel(templates)
         max_tpl_sz = max(max_tpl_sz, templates{ti}.sz);
@@ -267,7 +281,7 @@ function [placement, available, best_fit_frac] = try_place_best(available, templ
 
     [rr, cc, ss] = ind2sub(full_sz, find(available));
     if isempty(rr), return; end
-    pad = max_tpl_sz;
+    pad = max(4, ceil(max_tpl_sz * 0.25));
     roi_min = max([1 1 1], [min(rr) min(cc) min(ss)] - pad);
     roi_max = min(full_sz, [max(rr) max(cc) max(ss)] + pad);
 
@@ -277,19 +291,47 @@ function [placement, available, best_fit_frac] = try_place_best(available, templ
 
     D_crop = bwdist(~avail_crop) .* mean(spacing);
 
+    avail_vol_mm3 = sum(avail_crop(:)) * prod(spacing);
+
+    % FFT-based placement search. The overlap count at every position is a
+    % correlation of the availability map with the template mask; doing it
+    % in the frequency domain costs O(N log N) regardless of template size,
+    % where spatial convn costs O(N * template_vox) — minutes per attempt
+    % for large templates like Shear. The availability FFT is shared across
+    % all templates; the depth-map FFT is computed lazily on first use.
+    fftsz = crop_sz + max_tpl_sz - 1;
+    FA = fftn(single(avail_crop), fftsz);
+    FD = [];
+
+    n_eval = 0;
+    n_skip_vol = 0;
+    n_skip_bbox = 0;
+    min_skip_vol = Inf;
+
     for ti = 1:numel(templates)
         tpl = templates{ti};
         tsz = tpl.sz;
 
-        if any(tsz > crop_sz), continue; end
-
-        % Quick volume check: skip if template is larger than remaining region
-        if tpl.volume_mm3 > sum(avail_crop(:)) * prod(spacing) * 1.1
+        if any(tsz > crop_sz)
+            n_skip_bbox = n_skip_bbox + 1;
             continue;
         end
 
+        % Quick volume check: skip if template is larger than remaining region
+        if tpl.volume_mm3 > avail_vol_mm3 * 1.1
+            n_skip_vol = n_skip_vol + 1;
+            min_skip_vol = min(min_skip_vol, tpl.volume_mm3);
+            continue;
+        end
+        n_eval = n_eval + 1;
+
         n_template_vox = sum(tpl.mask(:));
-        overlap_count = convn(single(avail_crop), flip_3d(single(tpl.mask)), 'valid');
+        FK = fftn(flip_3d(single(tpl.mask)), fftsz);
+        overlap_full = real(ifftn(FA .* FK));
+        overlap_count = overlap_full(tsz(1):crop_sz(1), tsz(2):crop_sz(2), tsz(3):crop_sz(3));
+        % FFT round-trip noise is well under one voxel count — snap to
+        % integers so the fit fraction is exact.
+        overlap_count = max(0, round(overlap_count));
         fit_frac = overlap_count / max(1, n_template_vox);
 
         % Track best fit fraction across all templates (for diagnostics)
@@ -300,8 +342,13 @@ function [placement, available, best_fit_frac] = try_place_best(available, templ
 
         good_fit = fit_frac >= 0.95;
         if ~any(good_fit(:)), continue; end
+        had_fit(ti) = true;
 
-        depth_sum = convn(single(D_crop), flip_3d(single(tpl.mask)), 'valid');
+        if isempty(FD)
+            FD = fftn(single(D_crop), fftsz);
+        end
+        depth_full = real(ifftn(FD .* FK));
+        depth_sum = depth_full(tsz(1):crop_sz(1), tsz(2):crop_sz(2), tsz(3):crop_sz(3));
         avg_depth = depth_sum / max(1, n_template_vox);
 
         score_map = fit_frac + avg_depth;
@@ -316,7 +363,17 @@ function [placement, available, best_fit_frac] = try_place_best(available, templ
         end
     end
 
-    if isempty(best_pos), return; end
+    if isempty(best_pos)
+        % Explain why nothing was even evaluated, so "0% overlap" is never
+        % printed for a specimen that was skipped before evaluation.
+        if n_eval == 0 && n_skip_vol > 0
+            skip_msg = sprintf('specimen volume %.0f mm3 exceeds available region %.0f mm3', ...
+                min_skip_vol, avail_vol_mm3);
+        elseif n_eval == 0 && n_skip_bbox > 0
+            skip_msg = 'specimen extent exceeds region bounding box';
+        end
+        return;
+    end
 
     r1 = best_pos(1); c1 = best_pos(2); s1 = best_pos(3);
     tsz = best_tpl.sz;
@@ -427,29 +484,33 @@ function R = generate_bone_aligned_rotations(bone_axis, n_orient)
 
     R_base = [perp, perp2, bone_axis]';
 
-    R = zeros(3, 3, min(n_orient, 12));
-    idx = 0;
+    % Ordered (roll about bone axis, tilt off axis) pairs. The first 8
+    % reproduce the original coarse set (90-degree steps), so low
+    % PackingOrientations values behave exactly as before. The pairs after
+    % that add finer rolls and small tilts: for an elongated specimen in a
+    % curved bone, the difference between fitting and not fitting is often
+    % a 15-45 degree roll or tilt that 90-degree steps can never reach.
+    pairs = [ ...
+          0  0;   0 90;  90  0;  90 90; 180  0; 180 90; 270  0; 270 90; ... % original coarse set
+         30  0;  45  0;  60  0; 120  0; 135  0; 150  0; ...                 % finer rolls
+        210  0; 225  0; 240  0; 300  0; 315  0; 330  0; ...
+          0 15;  90 15; 180 15; 270 15; ...                                 % small tilts
+          0 -15; 90 -15; 180 -15; 270 -15; ...
+          0 75;  90 75; 180 75; 270 75; ...                                 % near-perpendicular tilts
+          0 105; 90 105];
 
-    angles_about_axis = [0, 90, 180, 270];
-    angles_perpendicular = [0, 90];
+    n = max(1, min(n_orient, size(pairs, 1)));
+    R = zeros(3, 3, n);
 
-    for ai = 1:numel(angles_about_axis)
-        for pi = 1:numel(angles_perpendicular)
-            idx = idx + 1;
-            if idx > n_orient, break; end
+    for idx = 1:n
+        theta = deg2rad(pairs(idx, 1));
+        phi = deg2rad(pairs(idx, 2));
 
-            theta = deg2rad(angles_about_axis(ai));
-            phi = deg2rad(angles_perpendicular(pi));
+        Rz = [cos(theta) -sin(theta) 0; sin(theta) cos(theta) 0; 0 0 1];
+        Rx = [1 0 0; 0 cos(phi) -sin(phi); 0 sin(phi) cos(phi)];
 
-            Rz = [cos(theta) -sin(theta) 0; sin(theta) cos(theta) 0; 0 0 1];
-            Rx = [1 0 0; 0 cos(phi) -sin(phi); 0 sin(phi) cos(phi)];
-
-            R(:,:,idx) = R_base * Rz * Rx;
-        end
-        if idx >= n_orient, break; end
+        R(:,:,idx) = R_base * Rz * Rx;
     end
-
-    R = R(:,:,1:idx);
 end
 
 

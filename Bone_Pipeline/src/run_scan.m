@@ -21,6 +21,9 @@ addpath(thisDir);
 %       with cortical bone shaved flat for 3-point bending. Lowers the
 %       minimum bone size (150 mm^3 instead of 500) and uses gentler
 %       surface cleanup so thin cortical plates survive.
+%   'PackingOrientations', 24  -> finer rotation sweep for specimen
+%       packing (default 6 = 90-degree steps only). Helps elongated
+%       specimens (Bend, Shear) fit inside curved bones.
 out = run_bone_pipeline(dicomFolder, stlFolder, ...
     'PackSpecimens', false, ...
     'PackWholeBone', false, ....
