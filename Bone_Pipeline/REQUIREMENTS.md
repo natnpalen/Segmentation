@@ -82,7 +82,7 @@ Two packing modes are available:
 
 **How it works:**
 
-1. **Build templates** — Each specimen STL mesh is loaded, rotated to several orientations aligned with the bone's long axis, and converted to a 3D voxel grid (voxelized) at the scan's resolution.
+1. **Build templates** — Each specimen STL mesh is loaded and first rotated so its own longest axis is canonical, regardless of which axis it was modeled along in the STL file (Bend's 20mm side is X, Shear's 40mm side is Z). It is then oriented relative to the bone: rolls rotate the specimen about the bone's long axis, tilts lean it off that axis, and each orientation is voxelized at the scan's resolution. Orientations that produce identical voxel shapes due to specimen symmetry — a 180° roll of a rectangular bar, any roll of a cylinder — are detected and searched only once, reported as "symmetric duplicates" in the log.
 
 2. **Find valid positions** — For each template, the specimen's overlap with available bone is measured at every position using FFT-based correlation (frequency-domain convolution). This costs about the same regardless of specimen size, where the old spatial convolution took minutes per attempt for large shapes like Shear — which is what makes finer orientation sweeps affordable. Positions where at least 95% of the specimen fits inside the bone are considered valid.
 

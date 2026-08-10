@@ -41,14 +41,49 @@ for si = 1:n_shapes
         continue;
     end
 
+    % Canonical shape alignment: rotate the shape so its own longest
+    % principal axis is +z BEFORE the roll/tilt/bone-frame rotation. The
+    % STLs are modeled with arbitrary axes (Bend's 20mm side is X, Shear's
+    % 40mm side is Z), so without this the meaning of "aligned with the
+    % bone" depended on how each STL happened to be drawn.
+    [Ev, ~] = eig(V_raw' * V_raw);
+    s_axis = Ev(:, 3);
+    if abs(s_axis(1)) < 0.9
+        s_p = cross(s_axis, [1; 0; 0]);
+    else
+        s_p = cross(s_axis, [0; 1; 0]);
+    end
+    s_p = s_p / norm(s_p);
+    s_p2 = cross(s_axis, s_p);
+    s_p2 = s_p2 / norm(s_p2);
+    S_align = [s_p, s_p2, s_axis]';   % maps shape long axis -> template +z
+
+    shape_tpls = {};
     n_valid = 0;
+    n_dup = 0;
     for oi = 1:n_orient
-        R = rotations(:,:,oi);
+        R = rotations(:,:,oi) * S_align;
         V_rot = (R * V_raw')';
         [shape_mask, ~] = voxelize_mesh(V_rot, F, spacing);
 
         shape_vol = sum(shape_mask(:)) * voxel_vol;
         if shape_vol < 0.1, continue; end
+
+        % Symmetry dedup: a 180-degree roll of a rectangular bar — or any
+        % roll of a cylinder — voxelizes to an identical mask. Searching
+        % the same voxel shape twice is pure waste, so keep one of each.
+        is_dup = false;
+        for di = 1:numel(shape_tpls)
+            if isequal(shape_tpls{di}.sz, size(shape_mask)) && ...
+                    isequal(shape_tpls{di}.mask, shape_mask)
+                is_dup = true;
+                break;
+            end
+        end
+        if is_dup
+            n_dup = n_dup + 1;
+            continue;
+        end
 
         tpl = struct();
         tpl.shape_idx = si;
@@ -60,12 +95,13 @@ for si = 1:n_shapes
         tpl.mask = shape_mask;
         tpl.volume_mm3 = shape_vol;
         tpl.sz = size(shape_mask);
-        templates{end+1} = tpl; %#ok<AGROW>
+        shape_tpls{end+1} = tpl; %#ok<AGROW>
         n_valid = n_valid + 1;
     end
-    fprintf('       [%s] %s: %d/%d orientations voxelized (%.0f mm3 each)\n', ...
-        tag, shape_names{si}, n_valid, n_orient, ...
-        ternary(n_valid > 0, templates{end}.volume_mm3, 0));
+    templates = [templates, shape_tpls];
+    fprintf('       [%s] %s: %d unique orientations (%d tried, %d symmetric duplicates, %.0f mm3 each)\n', ...
+        tag, shape_names{si}, n_valid, n_orient, n_dup, ...
+        ternary(n_valid > 0, shape_tpls{end}.volume_mm3, 0));
 end
 
 if isempty(templates)
@@ -482,7 +518,14 @@ function R = generate_bone_aligned_rotations(bone_axis, n_orient)
     perp2 = cross(bone_axis, perp);
     perp2 = perp2 / norm(perp2);
 
-    R_base = [perp, perp2, bone_axis]';
+    % Columns [perp, perp2, bone_axis]: maps template +z onto the bone's
+    % long axis, so phi=0 orientations lie ALONG the bone and theta rolls
+    % about it. The previous transposed form ([...]') mapped the bone axis
+    % onto +z instead — template orientations relative to the bone were
+    % scrambled, and with 6 orientations only one accidentally aligned an
+    % elongated specimen with the shaft (the likely reason Bend and Shear
+    % never fit whole metacarpals).
+    B_bone = [perp, perp2, bone_axis];
 
     % Ordered (roll about bone axis, tilt off axis) pairs. The first 8
     % reproduce the original coarse set (90-degree steps), so low
@@ -509,7 +552,7 @@ function R = generate_bone_aligned_rotations(bone_axis, n_orient)
         Rz = [cos(theta) -sin(theta) 0; sin(theta) cos(theta) 0; 0 0 1];
         Rx = [1 0 0; 0 cos(phi) -sin(phi); 0 sin(phi) cos(phi)];
 
-        R(:,:,idx) = R_base * Rz * Rx;
+        R(:,:,idx) = B_bone * Rz * Rx;
     end
 end
 
