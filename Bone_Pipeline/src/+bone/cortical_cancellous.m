@@ -253,6 +253,23 @@ se = strel('sphere', 1);
 cortical = imclose(cortical, se);
 cancellous = bone_mask & ~cortical;
 
+% ---- Uniform-density guard (all-cortical specimens) ----
+% Machined segments cut from the diaphysis are almost entirely cortical
+% bone: there is no real cortical->cancellous density drop, so the
+% gradient detector places an arbitrary boundary and labels dense interior
+% as "cancellous". If the interior density is close to the shell density,
+% the bone is uniform cortical — classify all of it as cortical.
+method = 'gradient_inflection';
+if any(cancellous(:))
+    cort_med = median(vol(cortical & vol > -200));
+    canc_med = median(vol(cancellous & vol > -200));
+    if isfinite(cort_med) && isfinite(canc_med) && canc_med > 0.65 * cort_med
+        cortical = bone_mask;
+        cancellous = false(size(bone_mask));
+        method = 'uniform_cortical';
+    end
+end
+
 % ---- Global summary stats ----
 cortical_vol = sum(cortical(:)) * voxel_vol;
 cancellous_vol = sum(cancellous(:)) * voxel_vol;
@@ -264,7 +281,7 @@ mean_threshold = mean(slab_threshold);
 
 % ---- Output info ----
 info = struct();
-info.method = 'gradient_inflection';
+info.method = method;
 info.bone_shape = bone_shape;
 info.elongation = elongation;
 info.n_slabs = n_slabs;

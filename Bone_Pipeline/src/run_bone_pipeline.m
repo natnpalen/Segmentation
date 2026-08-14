@@ -19,12 +19,24 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %
 % Name-value options
 %   'TagHUMin'            : 1200 (HU threshold for lead tag detection)
-%   'MinBoneVolMM3'       : 500  (minimum bone component volume)
+%   'MinBoneVolMM3'       : []   (minimum bone component volume; auto:
+%                                 500 normally, 150 in ShavedBoneMode)
+%   'SplitCorticalCancellous' : true (set false to skip the cortical/
+%                                 cancellous split; each bone is kept as a
+%                                 single region and packing runs whole-bone)
+%   'ShavedBoneMode'      : false (for machined specimens, e.g. metacarpals
+%                                 with cortical bone shaved flat for 3-point
+%                                 bending: lower size floor, gentler surface
+%                                 cleanup so thin cortical plates survive)
 %   'ClosingRadiusMM'     : 3.0  (morphological closing radius)
 %   'ArtifactSigmaMM'     : 3.0  (Gaussian falloff for artifact weighting)
 %   'PackSpecimens'       : true  (run specimen packing — slow)
 %   'PackWholeBone'       : false (pack into full bone ignoring cortical/cancellous)
-%   'PackingOrientations' : 6     (number of orientations per shape)
+%   'PackingOrientations' : 6     (orientations per shape, up to 34. The
+%                                 first 8 are coarse 90-degree steps; higher
+%                                 values add 30-45 degree rolls and 15-degree
+%                                 tilts. 24+ recommended for elongated
+%                                 specimens in curved bones.)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
 %   'SaveOutputs'         : true (export MAT, NIfTI, STL files)
 %   'OutputDir'           : ''   (auto-create if empty)
@@ -33,7 +45,9 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 % ---- Parse options ----
 opts = struct( ...
     'TagHUMin',            1200, ...
-    'MinBoneVolMM3',       500.0, ...
+    'MinBoneVolMM3',       [], ...
+    'SplitCorticalCancellous', true, ...
+    'ShavedBoneMode',      false, ...
     'ClosingRadiusMM',     3.0, ...
     'ArtifactSigmaMM',     3.0, ...
     'MarkerRangeHU',       [200 700], ...
@@ -49,6 +63,22 @@ opts = struct( ...
 );
 opts = utils.parse_opts(opts, varargin{:});
 
+% Mode-dependent defaults: shaved/machined specimens (e.g. 3-point bending
+% preparations) are much smaller than intact bones.
+if isempty(opts.MinBoneVolMM3)
+    if opts.ShavedBoneMode
+        opts.MinBoneVolMM3 = 150.0;
+    else
+        opts.MinBoneVolMM3 = 500.0;
+    end
+end
+
+% With the cortical/cancellous split disabled the only packable region is
+% the whole bone.
+if ~opts.SplitCorticalCancellous
+    opts.PackWholeBone = true;
+end
+
 t_start = tic;
 
 fprintf('\n');
@@ -57,6 +87,12 @@ fprintf('  BONE SEGMENTATION PIPELINE\n');
 fprintf('==========================================================\n');
 fprintf('  DICOM : %s\n', dicomFolder);
 fprintf('  STL   : %s\n', stlFolder);
+if opts.ShavedBoneMode
+    fprintf('  Mode  : shaved-bone (machined specimens)\n');
+end
+if ~opts.SplitCorticalCancellous
+    fprintf('  Mode  : whole-bone (cortical/cancellous split disabled)\n');
+end
 fprintf('==========================================================\n\n');
 
 % ==== Stage 1: DICOM Loading ====
@@ -84,8 +120,6 @@ if n_bones == 0
 end
 
 % ==== Stage 3: Cortical / Cancellous Segmentation ====
-fprintf('[3/6] Cortical/cancellous segmentation...');
-t3 = tic;
 seg_results = cell(1, n_bones);
 
 bone_masks = cell(1, n_bones);
@@ -94,18 +128,35 @@ for bi = 1:n_bones
 end
 
 use_parallel = ~isempty(ver('parallel')) && n_bones > 1;
-if use_parallel
-    parfor bi = 1:n_bones
-        [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
-        seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+
+if ~opts.SplitCorticalCancellous
+    fprintf('[3/6] Cortical/cancellous split disabled — each bone kept as one region\n\n');
+    sz_vol = size(ds.HU);
+    for bi = 1:n_bones
+        seg_info = struct('method', 'disabled', 'bone_shape', 'whole', ...
+            'elongation', 0, 'n_slabs', 0, 'axial_length_mm', 0, ...
+            'mean_cortical_depth_mm', NaN, 'mean_threshold_hu', NaN, ...
+            'cortical_volume_mm3', 0, 'cancellous_volume_mm3', 0, ...
+            'cortical_fraction', 0);
+        seg_results{bi} = struct('cortical', false(sz_vol), ...
+            'cancellous', false(sz_vol), 'info', seg_info);
     end
 else
-    for bi = 1:n_bones
-        [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
-        seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+    fprintf('[3/6] Cortical/cancellous segmentation...');
+    t3 = tic;
+    if use_parallel
+        parfor bi = 1:n_bones
+            [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
+            seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+        end
+    else
+        for bi = 1:n_bones
+            [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
+            seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+        end
     end
+    fprintf(' done (%.1fs)%s\n\n', toc(t3), ternary(use_parallel, ' [parallel]', ''));
 end
-fprintf(' done (%.1fs)%s\n\n', toc(t3), ternary(use_parallel, ' [parallel]', ''));
 
 % ==== Stage 4: Specimen Packing ====
 pack_results = cell(1, n_bones);
@@ -250,10 +301,12 @@ if opts.SaveOutputs
         % NIfTI masks
         try
             write_mask_nifti(fullfile(outDir, sprintf('bone_%02d_mask.nii.gz', bi)), bm, ds);
-            write_mask_nifti(fullfile(outDir, sprintf('bone_%02d_cortical.nii.gz', bi)), ...
-                seg_results{bi}.cortical, ds);
-            write_mask_nifti(fullfile(outDir, sprintf('bone_%02d_cancellous.nii.gz', bi)), ...
-                seg_results{bi}.cancellous, ds);
+            if opts.SplitCorticalCancellous
+                write_mask_nifti(fullfile(outDir, sprintf('bone_%02d_cortical.nii.gz', bi)), ...
+                    seg_results{bi}.cortical, ds);
+                write_mask_nifti(fullfile(outDir, sprintf('bone_%02d_cancellous.nii.gz', bi)), ...
+                    seg_results{bi}.cancellous, ds);
+            end
 
             HU_masked = int16(ds.HU);
             HU_masked(~bm) = -3000;
@@ -348,36 +401,55 @@ fprintf('  PIPELINE COMPLETE  (%.1f s)\n', elapsed);
 fprintf('==========================================================\n\n');
 
 % --- Bone summary table ---
-fprintf('  %-6s  %10s  %8s  %8s  %10s  %10s  %8s  %5s\n', ...
-    'Bone', 'Volume', 'Mean HU', 'Shape', 'Cortical', 'Cancellous', 'Cort %%', 'Tag');
-fprintf('  %-6s  %10s  %8s  %8s  %10s  %10s  %8s  %5s\n', ...
-    '------', '----------', '--------', '--------', '----------', '----------', '--------', '-----');
+if ~opts.SplitCorticalCancellous
+    fprintf('  %-6s  %10s  %8s  %5s\n', 'Bone', 'Volume', 'Mean HU', 'Tag');
+    fprintf('  %-6s  %10s  %8s  %5s\n', '------', '----------', '--------', '-----');
 
-total_vol = 0;
-total_cort = 0;
-total_canc = 0;
-for bi = 1:n_bones
-    b = sep_result.bones{bi};
-    si = seg_results{bi}.info;
-    total_vol = total_vol + b.volume_mm3;
-    total_cort = total_cort + si.cortical_volume_mm3;
-    total_canc = total_canc + si.cancellous_volume_mm3;
+    total_vol = 0;
+    for bi = 1:n_bones
+        b = sep_result.bones{bi};
+        total_vol = total_vol + b.volume_mm3;
+        if ~isempty(b.tag_id)
+            tag_str = sprintf('%d', b.tag_id);
+        else
+            tag_str = '-';
+        end
+        fprintf('  %-6s  %8.0f mm3  %6.0f HU  %5s\n', ...
+            sprintf('#%d', bi), b.volume_mm3, b.mean_hu, tag_str);
+    end
+    fprintf('  %-6s  %8.0f mm3\n', 'TOTAL', total_vol);
+else
+    fprintf('  %-6s  %10s  %8s  %8s  %10s  %10s  %8s  %5s\n', ...
+        'Bone', 'Volume', 'Mean HU', 'Shape', 'Cortical', 'Cancellous', 'Cort %%', 'Tag');
+    fprintf('  %-6s  %10s  %8s  %8s  %10s  %10s  %8s  %5s\n', ...
+        '------', '----------', '--------', '--------', '----------', '----------', '--------', '-----');
 
-    if ~isempty(b.tag_id)
-        tag_str = sprintf('%d', b.tag_id);
-    else
-        tag_str = '-';
+    total_vol = 0;
+    total_cort = 0;
+    total_canc = 0;
+    for bi = 1:n_bones
+        b = sep_result.bones{bi};
+        si = seg_results{bi}.info;
+        total_vol = total_vol + b.volume_mm3;
+        total_cort = total_cort + si.cortical_volume_mm3;
+        total_canc = total_canc + si.cancellous_volume_mm3;
+
+        if ~isempty(b.tag_id)
+            tag_str = sprintf('%d', b.tag_id);
+        else
+            tag_str = '-';
+        end
+
+        fprintf('  %-6s  %8.0f mm3  %6.0f HU  %8s  %8.0f mm3  %8.0f mm3  %6.1f%%  %5s\n', ...
+            sprintf('#%d', bi), b.volume_mm3, b.mean_hu, si.bone_shape, ...
+            si.cortical_volume_mm3, si.cancellous_volume_mm3, ...
+            si.cortical_fraction * 100, tag_str);
     end
 
-    fprintf('  %-6s  %8.0f mm3  %6.0f HU  %8s  %8.0f mm3  %8.0f mm3  %6.1f%%  %5s\n', ...
-        sprintf('#%d', bi), b.volume_mm3, b.mean_hu, si.bone_shape, ...
-        si.cortical_volume_mm3, si.cancellous_volume_mm3, ...
-        si.cortical_fraction * 100, tag_str);
+    fprintf('  %-6s  %8.0f mm3  %8s  %8s  %8.0f mm3  %8.0f mm3  %6.1f%%\n', ...
+        'TOTAL', total_vol, '', '', total_cort, total_canc, ...
+        total_cort / max(1, total_cort + total_canc) * 100);
 end
-
-fprintf('  %-6s  %8.0f mm3  %8s  %8s  %8.0f mm3  %8.0f mm3  %6.1f%%\n', ...
-    'TOTAL', total_vol, '', '', total_cort, total_canc, ...
-    total_cort / max(1, total_cort + total_canc) * 100);
 
 % --- Packing summary table ---
 has_packing = ~isempty(pack_results) && ~isempty(pack_results{1}) && ...
@@ -490,9 +562,13 @@ function write_summary_file(filepath, ds, sep_result, seg_results, pack_results,
         end
         fprintf(fid, 'Bone %d: %.1f mm3 | HU %.0f | %s | %s\n', ...
             bi, b.volume_mm3, b.mean_hu, si.bone_shape, tag_str);
-        fprintf(fid, '  Cortical: %.0f mm3 (%.1f%%) depth %.2f mm\n', ...
-            si.cortical_volume_mm3, si.cortical_fraction*100, si.mean_cortical_depth_mm);
-        fprintf(fid, '  Cancellous: %.0f mm3\n', si.cancellous_volume_mm3);
+        if isfield(si, 'method') && strcmp(si.method, 'disabled')
+            fprintf(fid, '  Whole bone (cortical/cancellous split disabled)\n');
+        else
+            fprintf(fid, '  Cortical: %.0f mm3 (%.1f%%) depth %.2f mm\n', ...
+                si.cortical_volume_mm3, si.cortical_fraction*100, si.mean_cortical_depth_mm);
+            fprintf(fid, '  Cancellous: %.0f mm3\n', si.cancellous_volume_mm3);
+        end
     end
 
     has_packing = ~isempty(pack_results) && ~isempty(pack_results{1}) && ...

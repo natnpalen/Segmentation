@@ -46,9 +46,9 @@ Finds and isolates each individual bone in the scan. The bones are excised (cut 
 
 1. **Find the markers** — Lead letters show up at very high HU (>3000). The pipeline finds these, then "grows" the marker mask outward to capture the attached metal flag tabs. This marker mask is used to prevent the bone segmentation from including marker material.
 
-2. **Find seed points** — The volume is thresholded to separate bone-like material from air. Connected regions are found and scored by shape (roundness, elongation) and size. Fragments split by marker exclusion are merged back together if they're within 5mm. One seed point is placed at the deepest interior point of each region.
+2. **Find seed points** — The volume is thresholded to separate bone-like material from air. Connected regions are found and scored by shape (roundness, elongation) and size. Fragments split by marker exclusion are merged back together if they're within 5mm. One seed point is placed at the deepest interior point of each region. Every candidate region is printed to the console with its volume, mean HU, dense-bone content, and — if it was rejected — the reason, so a scan that finds no bones tells you exactly which threshold to adjust. Regions with a low mean HU are only rejected if they also contain almost no dense (>250 HU) bone, so wet or tissue-covered specimens aren't discarded by their average density.
 
-3. **Grow each bone** — Starting from each seed, the bone region is expanded outward using a Fast Marching Method (FMM) — essentially a "smart flood fill" that follows bone-like densities and avoids markers and air. The growth speed is weighted by how bone-like each voxel is (based on HU) and how far it is from marker artifacts. Multiple growth thresholds are tested and the one producing the best-shaped result (scored by boundary sharpness and interior density) is kept.
+3. **Grow each bone** — Starting from each seed, the bone region is expanded outward using a Fast Marching Method (FMM) — essentially a "smart flood fill" that follows bone-like densities and avoids markers and air. The growth speed is weighted by how bone-like each voxel is (based on HU) and how far it is from marker artifacts. Multiple growth thresholds are tested and the one producing the best-shaped result (scored by boundary sharpness and interior density) is kept. A seed that fails to grow a bone prints the reason (e.g. its grown mask fell below the minimum volume) instead of disappearing silently. After all seeds are grown, a rescue pass checks each seed's source region for substantial uncovered material — the signature of two specimens close enough to be detected as one candidate, where only one gets grown — and grows the uncovered part as an additional bone. In shaved-bone mode the fragment-merge distance is also tightened from 5mm to 1.5mm, since machined segments packed a few mm apart in a tray are separate specimens, not fragments of one bone.
 
 4. **Clean up** — The raw bone masks are refined: the outer shell is sealed (small gaps closed), marker material is carved out, low-density surface tissue is scrubbed off, and small disconnected blobs are removed. Non-bone objects (mean HU < 50) are rejected. Each lead marker is associated with its nearest bone.
 
@@ -66,6 +66,10 @@ The bone is divided along its long axis into slabs (4mm wide). Within each slab,
 
 Bones are classified by shape — "elongated" bones like metacarpals get a thicker cortical allowance (up to 2.5mm) while "compact" bones like carpals get a thinner one (up to 1.2mm). The transition depth is smoothed across slabs so the cortical shell varies gradually along the bone's length.
 
+Two special cases:
+- **All-cortical specimens** — machined segments cut from the shaft are almost entirely cortical bone, with no real density drop toward the interior. If the interior density comes out close to the shell density (within 65%), the whole bone is classified as cortical instead of inventing an arbitrary boundary.
+- **Turning the split off** — set `SplitCorticalCancellous = false` to skip this stage entirely. Each bone is kept as a single whole region and specimen packing automatically runs in whole-bone mode.
+
 **Output:** Cortical mask, cancellous mask, and metrics (cortical thickness, cortical fraction, bone shape classification).
 
 ### Stage 4: Specimen Packing (~20-35 min, optional)
@@ -78,13 +82,13 @@ Two packing modes are available:
 
 **How it works:**
 
-1. **Build templates** — Each specimen STL mesh is loaded, rotated to several orientations aligned with the bone's long axis, and converted to a 3D voxel grid (voxelized) at the scan's resolution.
+1. **Build templates** — Each specimen STL mesh is loaded and first rotated so its own longest axis is canonical, regardless of which axis it was modeled along in the STL file (Bend's 20mm side is X, Shear's 40mm side is Z). It is then oriented relative to the bone: rolls rotate the specimen about the bone's long axis, tilts lean it off that axis, and each orientation is voxelized at the scan's resolution. Orientations that produce identical voxel shapes due to specimen symmetry — a 180° roll of a rectangular bar, any roll of a cylinder — are detected and searched only once, reported as "symmetric duplicates" in the log.
 
-2. **Find valid positions** — For each template, a 3D convolution slides it across the bone region and measures what fraction of the specimen overlaps with available bone at every position. Positions where at least 95% of the specimen fits inside the bone are considered valid.
+2. **Find valid positions** — For each template, the specimen's overlap with available bone is measured at every position using FFT-based correlation (frequency-domain convolution). This costs about the same regardless of specimen size, where the old spatial convolution took minutes per attempt for large shapes like Shear — which is what makes finer orientation sweeps affordable. Positions where at least 95% of the specimen fits inside the bone are considered valid.
 
-3. **Place specimens** — The best position is selected (highest overlap + greatest depth from the bone surface). That space is marked as used, and the search repeats. Priority phase places one of each type first, then a greedy phase fills remaining space.
+3. **Place specimens** — The best position is selected (highest overlap + greatest depth from the bone surface). That space is marked as used, and the search repeats. Priority phase places one of each type first, then a greedy phase fills remaining space. Since the available space only ever shrinks, a shape that fails to fit is permanently retired instead of being re-tried every round.
 
-The pipeline reports which shapes fit and which don't, along with the best overlap percentage achieved for shapes that couldn't be placed. A shape that reports "best overlap 72%" means at best only 72% of the specimen fits inside the bone — the specimen is too large for that bone in every orientation.
+The pipeline reports which shapes fit and which don't, along with the best overlap percentage achieved for shapes that couldn't be placed. A shape that reports "best overlap 72%" means at best only 72% of the specimen fits inside the bone — the specimen is too large for that bone in every orientation tried. A shape whose volume exceeds the remaining region volume is skipped before evaluation and reported as such (e.g. "specimen volume 1539 mm3 exceeds available region 519 mm3") rather than as a 0% overlap.
 
 **Output:** List of placed specimens with positions, orientations, and tissue classification.
 
@@ -128,11 +132,13 @@ Set these as name-value pairs in the `run_bone_pipeline()` call inside `run_scan
 |--------|---------|-------------|
 | `PackSpecimens` | `true` | Run specimen packing stage. Set to `false` to skip (saves ~30 min). |
 | `PackWholeBone` | `false` | Pack into the full bone volume as one region, ignoring cortical/cancellous boundaries. |
+| `SplitCorticalCancellous` | `true` | Set to `false` to turn off the cortical/cancellous sectioning entirely. Each bone is kept as one whole region, the cortical/cancellous NIfTI files are not written, and specimen packing automatically runs in whole-bone mode. |
+| `ShavedBoneMode` | `false` | For scans of machined specimens — e.g. metacarpals with parts of the cortical bone shaved flat for 3-point bending. Lowers the minimum bone size to 150 mm^3 (unless `MinBoneVolMM3` is set explicitly) and uses gentler surface cleanup so thin cortical plates aren't eroded away. Surface-cleanup HU thresholds are held at fixed low floors (~70-100 HU) instead of scaling with bone density, so cancellous bone exposed on machined cut faces is kept rather than scrubbed off as "tissue". After growth, an additive-only reclaim step recovers cancellous patches (>90 HU, within 4mm, connected to the mask) that the density-weighted growth never claimed — e.g. cancellous open to air at a cut face, which interior hole-filling cannot rescue. A partial-volume edge completion then adds the surface rind: voxels straddling the bone-air boundary average air with bone HU (reading ~-200..+100) and fail every density gate, so they are identified by context instead — non-air voxels pressed directly against dense in-mask bone. This recovers the mask's missing outer half-voxel at cut faces, sharp edges, and corners without picking up soft tissue, which has no dense-bone backing. Each bone's console line reports the reclaimed cancellous, the added edge rind, and any unclaimed bone-like material within 1mm of the final mask. |
 | `SaveOutputs` | `true` | Export MAT, NIfTI, and STL files. |
 | `ShowViewer` | `true` | Show interactive 3D visualization figures. |
-| `PackingOrientations` | `6` | Number of rotations to try per specimen shape. More orientations = better packing but slower. |
+| `PackingOrientations` | `6` | Number of rotations to try per specimen shape (up to 34). The first 8 are coarse 90° steps; higher values add 30-45° rolls and ±15° tilts around the bone axis. For elongated specimens (Bend, Shear) in curved bones, 24+ is recommended — the fit often hinges on an intermediate angle that 90° steps can't reach. The placement search is FFT-based, so extra orientations cost far less than they used to. |
 | `TagHUMin` | `1200` | HU threshold for metal tag detection. |
-| `MinBoneVolMM3` | `500` | Minimum bone volume (mm^3) to keep. Objects smaller than this are discarded. |
+| `MinBoneVolMM3` | auto | Minimum bone volume (mm^3) to keep. Objects smaller than this are discarded. Defaults to 500, or 150 when `ShavedBoneMode` is on. |
 | `ClosingRadiusMM` | `3.0` | Morphological closing radius for sealing small gaps in bone masks. |
 | `ArtifactSigmaMM` | `3.0` | Controls how far the marker artifact suppression extends from each marker. |
 | `TargetIsoMM` | `[]` (off) | Resample to isotropic voxels at this spacing (mm). Leave empty to keep original spacing. |
