@@ -5,7 +5,7 @@
 clear all; close all; clc; %#ok<CLALL>
 
 % ---- Set your paths here ----
-dicomFolder = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\New dicom files, spine and metacarpels\Batch 2\ScalarVolume_19';
+dicomFolder = 'C:\Users\natha\Downloads\Metacarpals from 8-5-26-20260814T194951Z-1-001\Metacarpals from 8-5-26\Batch 1\ScalarVolume_58';
 stlFolder   = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\Mechancial Specimens';
 
 % ---- Add this pipeline to the path ----
