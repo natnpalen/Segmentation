@@ -80,18 +80,42 @@ function filesList = list_dicom_files(folder)
     if ~isfolder(folder), error('Folder not found: %s', folder); end
     listing = dir(fullfile(folder, '**', '*'));
     files = listing(~[listing.isdir]);
+    files = files([files.bytes] >= 512);
     paths = fullfile({files.folder}, {files.name});
+
+    % Fast pass: the 'DICM' magic bytes at offset 128. Orders of magnitude
+    % cheaper than parsing every header, which matters when batching many
+    % scans. Files that carry the preamble are exactly the ones dicominfo
+    % accepts, and read_stack drops anything whose header fails to parse.
     keep = false(size(paths));
     for i = 1:numel(paths)
+        keep(i) = has_dicm_magic(paths{i});
+    end
+    if any(keep)
+        filesList = paths(keep);
+        return;
+    end
+
+    % Fallback: DICOM written without the 128-byte preamble.
+    for i = 1:numel(paths)
         try
-            d = dir(paths{i});
-            if d.bytes < 512, continue; end
             dicominfo(paths{i});
             keep(i) = true;
         catch
         end
     end
     filesList = paths(keep);
+end
+
+
+function tf = has_dicm_magic(filepath)
+    tf = false;
+    fid = fopen(filepath, 'r', 'ieee-le');
+    if fid < 0, return; end
+    cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+    if fseek(fid, 128, 'bof') ~= 0, return; end
+    magic = fread(fid, 4, '*char');
+    tf = numel(magic) == 4 && strcmp(magic(:).', 'DICM');
 end
 
 

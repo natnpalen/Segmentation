@@ -15,12 +15,27 @@ Automated segmentation of multiple excised-in-air bones from CT scans. Designed 
 
 ## How to Run
 
+There are two entry points: **single scan** (full pipeline) and **batch** (many scans, segmentation only).
+
+### Single scan — `run_scan.m`
+
 1. Open MATLAB and navigate to `Bone_Pipeline/src/`
 2. Edit `run_scan.m` — set `dicomFolder` to your DICOM series folder and `stlFolder` to your mechanical specimen STL folder
 3. Run:
    ```matlab
    run_scan
    ```
+
+### Batch — `run_batch.m`
+
+1. Open MATLAB and navigate to `Bone_Pipeline/src/`
+2. Edit `run_batch.m` — set `rootFolder` to the folder that holds one subfolder per scan
+3. Run:
+   ```matlab
+   run_batch
+   ```
+
+See [Batch Mode](#batch-mode) below for what it does and how to configure it.
 
 The pipeline is self-contained — no dependencies on other folders in the repository.
 
@@ -29,6 +44,8 @@ The pipeline is self-contained — no dependencies on other folders in the repos
 ## Pipeline Overview
 
 The pipeline runs 6 stages in sequence. A typical scan with 4 bones takes ~2 minutes without packing, or ~30 minutes with packing enabled.
+
+Stages 3, 4 and 5 are optional. Turning off `CorticalCancellous` reduces the run to loading, bone separation and saving — which is what [batch mode](#batch-mode) does, at roughly 1 minute per scan.
 
 ### Stage 1: DICOM Loading (~25-50s)
 
@@ -110,8 +127,8 @@ Writes all results to `bone_pipeline_outputs/<series_name>/<timestamp>/` next to
 | File | Description |
 |------|-------------|
 | `bone_XX_mask.nii.gz` | Binary bone mask — 1 inside bone, 0 outside. NIfTI format, compressed. |
-| `bone_XX_cortical.nii.gz` | Cortical (dense shell) region mask |
-| `bone_XX_cancellous.nii.gz` | Cancellous (spongy interior) region mask |
+| `bone_XX_cortical.nii.gz` | Cortical (dense shell) region mask — only when `CorticalCancellous` is on |
+| `bone_XX_cancellous.nii.gz` | Cancellous (spongy interior) region mask — only when `CorticalCancellous` is on |
 | `bone_XX_hu.nii.gz` | HU density values within the bone (non-bone voxels set to -3000) |
 | `bone_XX_voxelized.stl` | 3D bone mesh — voxel-accurate surface, minimal smoothing. Useful for measurements. |
 | `bone_XX_smooth.stl` | 3D bone mesh — smoothed and decimated for visualization and CAD import. |
@@ -126,6 +143,9 @@ Set these as name-value pairs in the `run_bone_pipeline()` call inside `run_scan
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `CorticalCancellous` | `true` | Run stage 3. Set to `false` for bone masks only — this also disables packing and visualization, which both need the cortical/cancellous split. |
+| `MaxBones` | `[]` (all) | Keep only the N largest bones found in the scan. Set to `1` for single-bone scans so stray objects are discarded. |
+| `SaveMat` | `true` | Write `pipeline_results.mat`. Set to `false` to skip it — it is by far the largest output file. |
 | `PackSpecimens` | `true` | Run specimen packing stage. Set to `false` to skip (saves ~30 min). |
 | `PackWholeBone` | `false` | Pack into the full bone volume as one region, ignoring cortical/cancellous boundaries. |
 | `SaveOutputs` | `true` | Export MAT, NIfTI, and STL files. |
@@ -141,16 +161,93 @@ Set these as name-value pairs in the `run_bone_pipeline()` call inside `run_scan
 
 ---
 
+## Batch Mode
+
+Batch mode segments every scan under one root folder without any per-scan setup. It is meant for large sets of single-bone scans: it runs **stages 1, 2 and 6 only** — DICOM loading, bone separation, and saving. No cortical/cancellous split, no specimen packing, no figures. Output is NIfTI masks and STL meshes.
+
+### Folder layout
+
+Point `rootFolder` at the folder holding one subfolder per scan. Nested image folders are found automatically, so both of these work:
+
+```
+New Bone Scans/                       New Bone Scans/
+  156L-1/DICOMOBJ/0000004F ...          156L-1/0000004F ...
+  156R-2/DICOMOBJ/...                   156R-2/...
+```
+
+A folder counts as a scan when it directly contains at least `MinFiles` DICOM images. Files are recognized by their `DICM` header bytes, so extensionless scanner exports are picked up. Generic wrapper folder names (`DICOMOBJ`, `DICOM`, `IMAGES`, ...) are dropped from the case name, so `156L-1/DICOMOBJ` becomes case `156L-1`.
+
+### Output
+
+Each scan gets its own folder under `<rootFolder>/bone_pipeline_batch/` (override with `OutputRoot`):
+
+```
+bone_pipeline_batch/
+  batch_summary.txt        <- per-case status, bone volumes, failures
+  batch_summary.csv        <- one row per bone, for Excel/analysis
+                              (includes n_bones_found, so scans where
+                               MaxBones discarded extra objects stand out)
+  156L-1/
+    bone_01_mask.nii.gz
+    bone_01_hu.nii.gz
+    bone_01_voxelized.stl
+    bone_01_smooth.stl
+    pipeline_summary.txt
+  156R-2/
+    ...
+```
+
+Both summary files are rewritten after every scan, so a long run can be inspected while it is still going and survives an interrupted session.
+
+### Behavior on long runs
+
+- **Failures don't stop the batch.** A scan that errors is recorded with its message in the summary and the run continues.
+- **Re-running resumes.** Cases that already have a `pipeline_summary.txt` and a bone mask are skipped. Pass `'Overwrite', true` to redo them.
+- **Check before committing.** Pass `'DryRun', true` to list the scans that would be processed without running any.
+
+### Batch options
+
+Set these in the `run_batch_pipeline()` call inside `run_batch.m`:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `OutputRoot` | `''` (auto) | Where results are written. Empty = `<rootFolder>/bone_pipeline_batch`. |
+| `MaxBones` | `1` | Bones to keep per scan. `1` suits single-bone scans; `[]` keeps everything found. |
+| `MinFiles` | `5` | Minimum DICOM files for a folder to count as a scan. Lower it for very short series. |
+| `Include` | `''` | Regular expression — only run cases whose name matches (e.g. `'^156'`). |
+| `Exclude` | `''` | Regular expression — skip cases whose name matches. |
+| `Overwrite` | `false` | Re-run cases that already have outputs. |
+| `DryRun` | `false` | List the discovered scans and stop. |
+| `SaveMat` | `false` | Also write the large `pipeline_results.mat` for each case. |
+| `PipelineArgs` | `{}` | Extra name-value pairs forwarded to `run_bone_pipeline`, e.g. `{'MinBoneVolMM3', 300}`. |
+
+Example — dry run first, then process only the left-hand specimens with a lower volume floor:
+
+```matlab
+run_batch_pipeline(rootFolder, 'DryRun', true);
+
+run_batch_pipeline(rootFolder, ...
+    'Include',      'L', ...
+    'PipelineArgs', {'MinBoneVolMM3', 300});
+```
+
+Batch mode runs scans one at a time; each scan holds a full CT volume in memory. To use more cores, split the root folder and run several MATLAB instances, or use `Include` to partition by name.
+
+---
+
 ## File Structure
 
 ```
 Bone_Pipeline/
   REQUIREMENTS.md          <- this file
   src/
-    run_scan.m             <- entry point: set your paths here and run
+    run_scan.m             <- entry point: single scan, full pipeline
+    run_batch.m            <- entry point: batch, segmentation only
     run_bone_pipeline.m    <- main pipeline orchestrator (6 stages)
+    run_batch_pipeline.m   <- batch orchestrator (finds and runs every scan)
     +dicom/
       series_load.m        <- DICOM CT series loader
+      find_series_dirs.m   <- finds DICOM series folders under a root
     +bone/
       separate_bones.m     <- multi-bone separation (FMM-based)
       cortical_cancellous.m <- cortical/cancellous segmentation
@@ -168,6 +265,7 @@ Bone_Pipeline/
 
 ### DICOM Folder
 - A folder containing CT scan DICOM files (one series, or multiple — the loader picks the dominant one)
+- For batch mode, a root folder holding one such folder per scan (see [Batch Mode](#batch-mode))
 - Scanner-exported files without `.dcm` extensions are supported (e.g. hex-named files like `0000004F`)
 - Typical scans: micro-CT or clinical CT of excised bone specimens in air
 
