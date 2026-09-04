@@ -13,7 +13,7 @@
 clear all; close all; clc; %#ok<CLALL>
 
 % ---- Set your paths here ----
-rootFolder = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\New Bone Scans';
+rootFolder = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\3D Scaphoid\Dicom Series Scaphoid';
 outputRoot = '';   % '' = <rootFolder>\bone_pipeline_batch
 
 % ---- Add this pipeline to the path ----
