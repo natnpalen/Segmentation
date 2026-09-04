@@ -15,12 +15,21 @@ function results = run_batch_pipeline(rootFolder, varargin)
 %     156L-1/DICOMOBJ/...    -> case '156L-1'
 %     156R-2/DICOMOBJ/...    -> case '156R-2'
 %
-% Each case is written to <OutputRoot>/<caseName>/. A run that dies on one
-% scan keeps going and records the failure; re-running skips cases that
-% already completed unless 'Overwrite' is true.
+% Outputs are sorted into folders by file type, with HU volumes kept apart
+% from mask volumes — see 'Organize' below. A run that dies on one scan keeps
+% going and records the failure; re-running skips cases that already
+% completed unless 'Overwrite' is true.
 %
 % Name-value options
 %   'OutputRoot'   : ''   output root ('' = <rootFolder>/bone_pipeline_batch)
+%   'Organize'     : 'type'  how outputs are foldered:
+%                     'type' - pooled across cases by file type:
+%                              <OutputRoot>/nifti_mask/<case>_bone_01_mask.nii.gz
+%                              <OutputRoot>/nifti_hu/<case>_bone_01_hu.nii.gz
+%                              <OutputRoot>/stl_smooth/, stl_voxelized/, summaries/
+%                     'case' - one folder per scan, split by type inside:
+%                              <OutputRoot>/<case>/nifti_mask/bone_01_mask.nii.gz
+%                     'flat' - everything for a scan in <OutputRoot>/<case>/
 %   'MaxBones'     : 1    bones to keep per scan (1 for single-bone scans;
 %                          [] keeps everything separate_bones finds)
 %   'MinFiles'     : 5    minimum DICOM files for a folder to count as a series
@@ -40,6 +49,7 @@ function results = run_batch_pipeline(rootFolder, varargin)
 
 o = struct( ...
     'OutputRoot',   '', ...
+    'Organize',     'type', ...
     'MaxBones',     1, ...
     'MinFiles',     5, ...
     'Include',      '', ...
@@ -65,12 +75,21 @@ else
     outputRoot = o.OutputRoot;
 end
 
+organize = lower(char(o.Organize));
+if ~ismember(organize, {'type', 'case', 'flat'})
+    error('Organize must be ''type'', ''case'' or ''flat'' (got ''%s'').', organize);
+end
+% Cases run into a staging folder first, then get filed by type, so a case
+% folder never collides with a type folder.
+stagingRoot = fullfile(outputRoot, '_staging');
+
 fprintf('\n');
 fprintf('==========================================================\n');
 fprintf('  BONE SEGMENTATION — BATCH MODE\n');
 fprintf('==========================================================\n');
 fprintf('  Root   : %s\n', rootFolder);
 fprintf('  Output : %s\n', outputRoot);
+fprintf('  Layout : %s\n', layout_description(organize));
 fprintf('==========================================================\n\n');
 
 % ---- Discover DICOM series ----
@@ -126,18 +145,37 @@ t_batch = tic;
 
 for i = 1:n_cases
     s = series(i);
-    caseOut = fullfile(outputRoot, s.name);
+
+    if strcmp(organize, 'flat')
+        caseOut = fullfile(outputRoot, s.name);   % pipeline writes final files
+        finalOut = caseOut;
+    else
+        caseOut = fullfile(stagingRoot, s.name);  % pipeline writes, then filed
+        if strcmp(organize, 'case')
+            finalOut = fullfile(outputRoot, s.name);
+        else
+            finalOut = outputRoot;
+        end
+    end
 
     fprintf('----------------------------------------------------------\n');
     fprintf('[%d/%d] %s\n', i, n_cases, s.name);
     fprintf('----------------------------------------------------------\n');
 
-    if ~o.Overwrite && case_is_done(caseOut)
+    if ~o.Overwrite && case_is_done(outputRoot, s.name, organize)
         fprintf('  Already processed — skipping (use ''Overwrite'', true to redo)\n\n');
         r = make_result(s, 'skipped', 'existing outputs');
-        r.outputDir = caseOut;
+        r.outputDir = finalOut;
         results(i) = r; %#ok<AGROW>
         continue;
+    end
+
+    % Clear any partial staging left by an interrupted run
+    if ~strcmp(organize, 'flat') && isfolder(caseOut)
+        [ok, msg] = rmdir(caseOut, 's');
+        if ~ok
+            warning('Could not clear staging folder %s: %s', caseOut, msg);
+        end
     end
 
     t_case = tic;
@@ -152,8 +190,14 @@ for i = 1:n_cases
             'OutputDir',          caseOut, ...
             o.PipelineArgs{:});
 
+        % File the outputs by type
+        if ~strcmp(organize, 'flat')
+            n_moved = utils.organize_outputs(caseOut, outputRoot, s.name, organize);
+            fprintf('       Filed %d output files by type\n\n', n_moved);
+        end
+
         r = make_result(s, 'ok', '');
-        r.outputDir = caseOut;
+        r.outputDir = finalOut;
         r.elapsed_s = toc(t_case);
         r.n_bones = numel(out.separation.bones);
         r.n_markers = out.separation.n_tags;
@@ -178,7 +222,7 @@ for i = 1:n_cases
     catch ME
         fprintf(2, '  FAILED: %s\n\n', ME.message);
         r = make_result(s, 'failed', ME.message);
-        r.outputDir = caseOut;
+        r.outputDir = caseOut;   % partial files stay in staging for inspection
         r.elapsed_s = toc(t_case);
         results(i) = r; %#ok<AGROW>
     end
@@ -193,6 +237,17 @@ for i = 1:n_cases
 end
 
 elapsed = toc(t_batch);
+
+% ---- Drop the staging folder if every case filed cleanly ----
+if ~strcmp(organize, 'flat') && isfolder(stagingRoot)
+    leftover = dir(stagingRoot);
+    leftover = leftover(~ismember({leftover.name}, {'.', '..'}));
+    if isempty(leftover)
+        rmdir(stagingRoot);
+    else
+        fprintf('\n  Note: partial outputs from failed scans left in %s\n', stagingRoot);
+    end
+end
 
 % ---- Final report ----
 n_ok      = sum(strcmp({results.status}, 'ok'));
@@ -261,12 +316,38 @@ function r = make_result(s, status, message)
 end
 
 
-function tf = case_is_done(caseOut)
-% A case counts as finished once the pipeline wrote its summary and at
-% least one bone mask.
-    tf = isfolder(caseOut) && ...
-         exist(fullfile(caseOut, 'pipeline_summary.txt'), 'file') == 2 && ...
-         ~isempty(dir(fullfile(caseOut, 'bone_*_mask.nii.gz')));
+function tf = case_is_done(outputRoot, caseName, organize)
+% A case counts as finished once its summary and at least one bone mask are
+% in place, wherever the chosen layout puts them.
+    switch organize
+        case 'flat'
+            caseDir = fullfile(outputRoot, caseName);
+            summaryFile = fullfile(caseDir, 'pipeline_summary.txt');
+            maskGlob = fullfile(caseDir, 'bone_*_mask.nii.gz');
+        case 'case'
+            caseDir = fullfile(outputRoot, caseName);
+            summaryFile = fullfile(caseDir, 'summaries', 'pipeline_summary.txt');
+            maskGlob = fullfile(caseDir, 'nifti_mask', 'bone_*_mask.nii.gz');
+        otherwise  % 'type'
+            summaryFile = fullfile(outputRoot, 'summaries', ...
+                [caseName '_pipeline_summary.txt']);
+            maskGlob = fullfile(outputRoot, 'nifti_mask', ...
+                [caseName '_bone_*_mask.nii.gz']);
+    end
+
+    tf = exist(summaryFile, 'file') == 2 && ~isempty(dir(maskGlob));
+end
+
+
+function s = layout_description(organize)
+    switch organize
+        case 'flat'
+            s = 'one folder per scan (files together)';
+        case 'case'
+            s = 'one folder per scan, split by file type';
+        otherwise
+            s = 'pooled by file type across all scans';
+    end
 end
 
 
@@ -284,6 +365,8 @@ function write_batch_summary(outputRoot, rootFolder, results, o)
     fprintf(fid, 'Date     : %s\n', datestr(now));
     fprintf(fid, 'Root     : %s\n', rootFolder);
     fprintf(fid, 'Output   : %s\n', outputRoot);
+    fprintf(fid, 'Layout   : %s (%s)\n', lower(char(o.Organize)), ...
+        layout_description(lower(char(o.Organize))));
     fprintf(fid, 'MaxBones : %s\n\n', mat2str(o.MaxBones));
 
     for i = 1:numel(results)

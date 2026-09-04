@@ -179,7 +179,7 @@ A folder counts as a scan when it directly contains at least `MinFiles` DICOM im
 
 ### Output
 
-Each scan gets its own folder under `<rootFolder>/bone_pipeline_batch/` (override with `OutputRoot`):
+Everything lands under `<rootFolder>/bone_pipeline_batch/` (override with `OutputRoot`). By default results are **filed by file type**, pooled across every scan, with HU volumes kept in their own folder apart from the masks. Each file is prefixed with its case name so it stays traceable:
 
 ```
 bone_pipeline_batch/
@@ -187,17 +187,34 @@ bone_pipeline_batch/
   batch_summary.csv        <- one row per bone, for Excel/analysis
                               (includes n_bones_found, so scans where
                                MaxBones discarded extra objects stand out)
-  156L-1/
-    bone_01_mask.nii.gz
-    bone_01_hu.nii.gz
-    bone_01_voxelized.stl
-    bone_01_smooth.stl
-    pipeline_summary.txt
-  156R-2/
-    ...
+  nifti_mask/
+    156L-1_bone_01_mask.nii.gz
+    156R-2_bone_01_mask.nii.gz
+  nifti_hu/
+    156L-1_bone_01_hu.nii.gz
+    156R-2_bone_01_hu.nii.gz
+  stl_smooth/
+    156L-1_bone_01_smooth.stl
+    156R-2_bone_01_smooth.stl
+  stl_voxelized/
+    156L-1_bone_01_voxelized.stl
+  summaries/
+    156L-1_pipeline_summary.txt
 ```
 
 Both summary files are rewritten after every scan, so a long run can be inspected while it is still going and survives an interrupted session.
+
+### Output layout — the `Organize` option
+
+| Value | Layout |
+|-------|--------|
+| `'type'` (default) | Pooled by file type across all scans: `<OutputRoot>/nifti_mask/<case>_bone_01_mask.nii.gz`. Best for large batches — every mask, or every STL, in one place. |
+| `'case'` | One folder per scan, split by type inside it: `<OutputRoot>/156L-1/nifti_mask/bone_01_mask.nii.gz`. Best when you work one specimen at a time. |
+| `'flat'` | One folder per scan with all its files together: `<OutputRoot>/156L-1/bone_01_mask.nii.gz`. Matches the single-scan pipeline's layout. |
+
+Type folders are `nifti_mask`, `nifti_hu`, `stl_smooth`, `stl_voxelized`, `summaries`, plus `nifti_cortical` / `nifti_cancellous` / `mat` / `figures` if you re-enable those stages through `PipelineArgs`. Anything unrecognized goes to `other`.
+
+Scans run into a temporary `_staging/<case>/` folder and are filed once they finish, so a case folder can never collide with a type folder. `_staging` is removed at the end of the run; if it survives, it holds the partial output of scans that failed.
 
 ### Behavior on long runs
 
@@ -212,11 +229,12 @@ Set these in the `run_batch_pipeline()` call inside `run_batch.m`:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `OutputRoot` | `''` (auto) | Where results are written. Empty = `<rootFolder>/bone_pipeline_batch`. |
+| `Organize` | `'type'` | Output layout: `'type'`, `'case'` or `'flat'` — see the table above. |
 | `MaxBones` | `1` | Bones to keep per scan. `1` suits single-bone scans; `[]` keeps everything found. |
 | `MinFiles` | `5` | Minimum DICOM files for a folder to count as a scan. Lower it for very short series. |
 | `Include` | `''` | Regular expression — only run cases whose name matches (e.g. `'^156'`). |
 | `Exclude` | `''` | Regular expression — skip cases whose name matches. |
-| `Overwrite` | `false` | Re-run cases that already have outputs. |
+| `Overwrite` | `false` | Re-run cases that already have outputs. Files are replaced in place, not cleared first — if a re-run finds fewer bones than the previous one did, the leftover `bone_02_*` files from the earlier run stay behind. Delete that case's files first if that matters. |
 | `DryRun` | `false` | List the discovered scans and stop. |
 | `SaveMat` | `false` | Also write the large `pipeline_results.mat` for each case. |
 | `PipelineArgs` | `{}` | Extra name-value pairs forwarded to `run_bone_pipeline`, e.g. `{'MinBoneVolMM3', 300}`. |
@@ -257,6 +275,7 @@ Bone_Pipeline/
       write_stl_binary.m   <- binary STL file writer
     +utils/
       parse_opts.m         <- name-value option parser
+      organize_outputs.m   <- files batch outputs into per-type folders
 ```
 
 ---
