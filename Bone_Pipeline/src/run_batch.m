@@ -38,6 +38,11 @@ results = run_batch_pipeline(rootFolder, ...
     'MaxBones',   1, ...
     'Organize',   'type');
 
+% Check batch_summary.csv when the run finishes: the 'review' column marks
+% scans the segmentation was unsure about (low density, tissue suspected, or
+% under-segmented) and 'pass' says whether the fallback was needed. Those are
+% the ones worth opening by eye.
+
 % Tip: add 'DryRun', true to list what would be processed without running,
 % or 'Overwrite', true to redo cases that already have outputs.
 %

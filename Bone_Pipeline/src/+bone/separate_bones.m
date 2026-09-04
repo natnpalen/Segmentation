@@ -14,6 +14,8 @@ function result = separate_bones(ds, opts)
 %   4. Post-processing: marker carve, shell sealing, boundary refine
 %   5. Reject non-bone objects (negative mean HU)
 
+opts = bone.segment_options(opts);
+
 vol = double(ds.HU);
 spacing = ds.spacing;
 voxel_vol = prod(spacing);
@@ -113,7 +115,8 @@ for si = 1:numel(seeds)
 
     vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
     if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
-    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
+    core_thr_L = opts.DensityScale * ...
+        max(280, min(700, prctile(vals_L, opts.CorePrctile)));
     core_L = vol_L > core_thr_L;
 
     % Exclude near-marker voxels from core and reachable mask.
@@ -125,7 +128,7 @@ for si = 1:numel(seeds)
     core_L = core_L & ~near_marker_L;
 
     % Allow = moderate HU OR high gradient (catches cancellous bone)
-    HU_ALLOW_MIN = max(70, min(220, softMed + 110));
+    HU_ALLOW_MIN = opts.DensityScale * max(70, min(220, softMed + 110));
     gThr_L = prctile(G_L(:), 85);
     maskR_L = (vol_L > HU_ALLOW_MIN) | (G_L > gThr_L);
 
@@ -167,7 +170,7 @@ for si = 1:numel(seeds)
     specimen_L = imclose(specimen_L, strel('sphere', 1));
 
     % Adaptive threshold sweep (scaphoid approach)
-    mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L);
+    mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L, opts);
 
     if ~any(mask_bone_L(:))
         continue;
@@ -202,7 +205,7 @@ for si = 1:numel(seeds)
     else
         local_softMed = softMed;
     end
-    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed);
+    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, local_softMed, opts);
 
     % Remove small disconnected blobs using 6-connectivity (face-touching
     % only). Corner-connected fragments that look disconnected in the
@@ -216,7 +219,7 @@ for si = 1:numel(seeds)
     end
 
     % Surface tissue scrub: remove low-density voxels clinging to surface
-    mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing);
+    mask_bone_L = scrub_surface_tissue(mask_bone_L, vol_L, spacing, opts);
 
     % Paste back to full volume
     mask_bone = false(sz);
@@ -250,6 +253,10 @@ for si = 1:numel(seeds)
     bone_info.mean_hu = bone_hu;
     bone_info.dense_fraction = sum(vol(mask_bone) > 200) / max(1, sum(mask_bone(:)));
     bone_info.bbox = bbox;
+    % Volume of the non-air blob this bone grew out of. A bone that ends up
+    % far smaller than its source blob was either under-segmented or had a
+    % lot of tissue around it — bone.mask_quality uses the ratio.
+    bone_info.source_vol_mm3 = seeds{si}.comp_vol_mm3;
     bone_info.tag_id = [];
     bone_info.tag_dist = Inf;
 
@@ -258,7 +265,7 @@ for si = 1:numel(seeds)
 end
 
 % ---- Stage 4: Reject non-bone objects (negative mean HU) ----
-MIN_BONE_HU = 50;
+MIN_BONE_HU = opts.MinBoneHU;
 n_before = numel(bones);
 keep = true(1, numel(bones));
 for bi = 1:numel(bones)
@@ -433,16 +440,16 @@ end
 % =========================================================================
 %  ADAPTIVE FMM THRESHOLD (scaphoid segmentScaphoidFMM scoring)
 % =========================================================================
-function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
+function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen, opts)
     % Use same boundary score image as scaphoid: 1 - gradientweight
     Gsrc = 1 - mat2gray(gradientweight(vol));
 
-    ths = linspace(0.14, 0.42, 9);
+    ths = linspace(0.14, opts.FMMThreshMax, 9);
     % For excised-in-air: softMed ~280-370 reflects bone tissue, not soft
     % tissue. Using softMed+220 gives HU_MIN=400-500 which penalizes
     % cancellous bone (100-300 HU), creating hollow interiors. Use a low
     % threshold that only rejects air, not real bone tissue.
-    HU_MIN = max(50, min(200, softMed * 0.4));
+    HU_MIN = opts.DensityScale * max(50, min(200, softMed * 0.4));
     lambda = 0.5;
 
     best_score = -Inf;
@@ -655,7 +662,7 @@ end
 %  BOUNDARY REFINEMENT (ported from scaphoid cling-prune-carve chain)
 %  Protects the deep interior, aggressively cleans tissue from the surface.
 % =========================================================================
-function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed)
+function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed, opts)
     if ~any(mask(:)), return; end
     voxmm = mean(spacing);
 
@@ -669,10 +676,10 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
 
     vals = double(vol(~marker_mask & vol > -300 & vol < 2000));
     if isempty(vals), vals = double(vol(isfinite(vol))); end
-    core_thr = max(240, min(650, prctile(vals, 92)));
+    core_thr = opts.DensityScale * max(240, min(650, prctile(vals, 92)));
     core_seed = band & (vol > core_thr);
 
-    HU_SUPPORT_MIN = max(60, min(180, softMed + 90));
+    HU_SUPPORT_MIN = opts.DensityScale * max(60, min(180, softMed + 90));
     gThr = prctile(G(:), 80);
     support = band & ((vol > HU_SUPPORT_MIN) | (G > gThr));
 
@@ -691,7 +698,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     % Thresholds scale with bone density so low-density bones aren't destroyed.
     perim = bwperim(mask, 26);
     band1 = imdilate(perim, strel('sphere', 1));
-    T_hu = max(80, min(340, softMed * 0.7));
+    T_hu = opts.DensityScale * max(80, min(340, softMed * 0.7));
     T_g = prctile(G(:), 70);
     kill = band1 & (double(vol) < T_hu) & (G < T_g);
     if any(kill(:))
@@ -707,7 +714,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
     band1 = imdilate(perim, strel('sphere', 1));
     outer1 = imdilate(mask, strel('sphere', 1)) & ~mask;
     protected_core = imdilate(vol > core_thr, strel('sphere', 2));
-    T_lo = max(80, min(280, softMed * 0.5));
+    T_lo = opts.DensityScale * max(80, min(280, softMed * 0.5));
     airNear = outer1 & imdilate(vol < -300, strel('sphere', 1));
     kill = band1 & (double(vol) < T_lo) & imdilate(airNear, strel('sphere', 1)) & ~protected_core;
     if any(kill(:))
@@ -719,7 +726,7 @@ function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed
 
     % --- Step 4: Final boundary carve ---
     band1 = imdilate(bwperim(mask, 26), strel('sphere', 1));
-    HU_CARVE_FLOOR = max(80, min(300, softMed * 0.6));
+    HU_CARVE_FLOOR = opts.DensityScale * max(80, min(300, softMed * 0.6));
     kill = band1 & (double(vol) < HU_CARVE_FLOOR);
     if any(kill(:))
         mask(kill) = false;
@@ -760,7 +767,7 @@ end
 % =========================================================================
 %  SURFACE TISSUE SCRUB
 % =========================================================================
-function mask = scrub_surface_tissue(mask, vol, spacing)
+function mask = scrub_surface_tissue(mask, vol, spacing, opts)
 % Remove low-density surface voxels that are likely residual soft tissue.
 % Only touches the outermost shell (within 1 voxel of air). Compares
 % surface HU against the bone's interior median to identify tissue.
@@ -790,7 +797,7 @@ function mask = scrub_surface_tissue(mask, vol, spacing)
 
     % Tissue threshold: surface voxels far below interior density
     % Use 25% of interior median, with a floor of 80 HU
-    tissue_thr = max(80, interior_med * 0.25);
+    tissue_thr = opts.TissueScrub * max(80, interior_med * 0.25);
 
     % Remove surface voxels below threshold
     to_remove = surface_shell & (vol < tissue_thr);
