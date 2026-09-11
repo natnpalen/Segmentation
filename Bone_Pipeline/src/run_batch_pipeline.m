@@ -45,7 +45,12 @@ function results = run_batch_pipeline(rootFolder, varargin)
 %   results : struct array, one entry per case, with fields name, path,
 %             status ('ok' | 'failed' | 'skipped' | 'no_bones'), n_bones,
 %             n_bones_found (before the MaxBones cap), n_markers,
-%             volumes_mm3, mean_hu, elapsed_s, outputDir, message.
+%             volumes_mm3, mean_hu, preset (which segmentation pass won),
+%             flags (per-bone quality flags), elapsed_s, outputDir, message.
+%
+% batch_summary.csv carries the pass and quality flags per bone plus a
+% 'review' column, so scans the segmentation was unsure about can be pulled
+% out and checked by eye instead of being trusted silently.
 
 o = struct( ...
     'OutputRoot',   '', ...
@@ -210,9 +215,20 @@ for i = 1:n_cases
             r.message = sprintf('%d objects found, kept %d largest', ...
                 r.n_bones_found, r.n_bones);
         end
+        if isfield(out.separation, 'preset')
+            r.preset = out.separation.preset;
+        end
         if r.n_bones > 0
             r.volumes_mm3 = cellfun(@(b) b.volume_mm3, out.separation.bones);
             r.mean_hu = cellfun(@(b) b.mean_hu, out.separation.bones);
+            r.flags = cell(1, r.n_bones);
+            for bi = 1:r.n_bones
+                if isfield(out.separation.bones{bi}, 'quality')
+                    r.flags{bi} = strjoin(out.separation.bones{bi}.quality.flags, '|');
+                else
+                    r.flags{bi} = '';
+                end
+            end
         else
             r.status = 'no_bones';
             r.message = 'no bones found';
@@ -295,7 +311,8 @@ end
 function results = empty_results()
     results = struct('name', {}, 'path', {}, 'relpath', {}, 'status', {}, ...
         'message', {}, 'n_bones', {}, 'n_bones_found', {}, 'n_markers', {}, ...
-        'volumes_mm3', {}, 'mean_hu', {}, 'elapsed_s', {}, 'outputDir', {});
+        'volumes_mm3', {}, 'mean_hu', {}, 'preset', {}, 'flags', {}, ...
+        'elapsed_s', {}, 'outputDir', {});
 end
 
 
@@ -311,6 +328,8 @@ function r = make_result(s, status, message)
     r.n_markers     = 0;
     r.volumes_mm3 = [];
     r.mean_hu     = [];
+    r.preset      = '';
+    r.flags       = {};
     r.elapsed_s   = 0;
     r.outputDir   = '';
 end
@@ -375,8 +394,13 @@ function write_batch_summary(outputRoot, rootFolder, results, o)
             r.name, r.status, r.n_bones, r.elapsed_s);
         fprintf(fid, '    source: %s\n', r.path);
         for bi = 1:numel(r.volumes_mm3)
-            fprintf(fid, '    bone %d: %.1f mm3, mean HU %.0f\n', ...
-                bi, r.volumes_mm3(bi), r.mean_hu(bi));
+            if bi <= numel(r.flags) && ~isempty(r.flags{bi})
+                fl = sprintf(' [%s]', strrep(r.flags{bi}, '|', ', '));
+            else
+                fl = '';
+            end
+            fprintf(fid, '    bone %d: %.1f mm3, mean HU %.0f%s\n', ...
+                bi, r.volumes_mm3(bi), r.mean_hu(bi), fl);
         end
         if ~isempty(r.message)
             fprintf(fid, '    note: %s\n', r.message);
@@ -389,17 +413,21 @@ function write_batch_summary(outputRoot, rootFolder, results, o)
     end
     ccleanup = onCleanup(@() fclose(cfid)); %#ok<NASGU>
     fprintf(cfid, ['case,status,bone_index,volume_mm3,mean_hu,n_bones_found,' ...
-                   'n_markers,elapsed_s,dicom_folder,output_folder\n']);
+                   'n_markers,pass,quality_flags,review,elapsed_s,' ...
+                   'dicom_folder,output_folder\n']);
     for i = 1:numel(results)
         r = results(i);
         if isempty(r.volumes_mm3)
-            fprintf(cfid, '%s,%s,,,,%d,%d,%.1f,%s,%s\n', csv(r.name), csv(r.status), ...
-                r.n_bones_found, r.n_markers, r.elapsed_s, csv(r.path), csv(r.outputDir));
+            fprintf(cfid, '%s,%s,,,,%d,%d,%s,,,%.1f,%s,%s\n', csv(r.name), csv(r.status), ...
+                r.n_bones_found, r.n_markers, csv(r.preset), r.elapsed_s, ...
+                csv(r.path), csv(r.outputDir));
         else
             for bi = 1:numel(r.volumes_mm3)
-                fprintf(cfid, '%s,%s,%d,%.1f,%.0f,%d,%d,%.1f,%s,%s\n', ...
+                if bi <= numel(r.flags), fl = r.flags{bi}; else, fl = ''; end
+                fprintf(cfid, '%s,%s,%d,%.1f,%.0f,%d,%d,%s,%s,%d,%.1f,%s,%s\n', ...
                     csv(r.name), csv(r.status), bi, r.volumes_mm3(bi), ...
-                    r.mean_hu(bi), r.n_bones_found, r.n_markers, r.elapsed_s, ...
+                    r.mean_hu(bi), r.n_bones_found, r.n_markers, ...
+                    csv(r.preset), csv(fl), ~isempty(fl), r.elapsed_s, ...
                     csv(r.path), csv(r.outputDir));
             end
         end
@@ -410,7 +438,7 @@ end
 function s = csv(s)
     s = strrep(char(s), '"', '""');
     if any(ismember(s, ',"'))
-        s = ['"' s '"'];
+        s = sprintf('"%s"', s);
     end
 end
 

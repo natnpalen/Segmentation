@@ -33,6 +33,28 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'SaveMat'             : true (include pipeline_results.mat — large)
 %   'OutputDir'           : ''   (auto-create if empty)
 %   'ShowViewer'          : true (show 3D visualization)
+%
+% Fallback for difficult scans (see bone.segment_options)
+%   'Fallback'            : true  retry with a different preset when the
+%                                 standard pass fails or looks contaminated
+%   'FallbackPreset'      : ''    force a preset instead of choosing one
+%                                 ('lowdensity' | 'tissue' | 'none')
+%   'LowDensityHU'        : 250   below this interior median, flag as
+%                                 osteoporotic
+%   'MinContrastHU'       : 150   minimum bone-to-surroundings density step
+%   'MaxLowFrac'          : 0.35  max fraction of mask below TissueCeilingHU
+%   'TissueCeilingHU'     : 150   HU below which a voxel is not clearly bone
+%   'MinFillRatio'        : 0.50  mask volume / source blob volume floor
+%   'LowDensityFillRatio' : 0.75  retry a low-density bone below this fill
+%
+% Segmentation knobs (empty = preset default, see bone.segment_options)
+%   'DensityScale', 'CorePrctile', 'FMMThreshMax', 'TissueScrub', 'MinBoneHU'
+%
+% Mesh export
+%   'MeshSmoothIterations': 8    Taubin smoothing passes (0 = none)
+%   'MeshSmoothLambda'    : 0.5  Taubin shrink weight
+%   'MeshPreSmoothSigma'  : 1.0  Gaussian sigma applied to the mask first
+%   'MeshDecimate'        : 0.5  fraction of faces kept in the smooth STL
 
 % ---- Parse options ----
 opts = struct( ...
@@ -52,7 +74,24 @@ opts = struct( ...
     'OutputDir',           '', ...
     'ShowViewer',          true, ...
     'TargetIsoMM',         [], ...
-    'Smoothing',           false ...
+    'Smoothing',           false, ...
+    'Fallback',            true, ...
+    'FallbackPreset',      '', ...
+    'LowDensityHU',        250, ...
+    'MinContrastHU',       150, ...
+    'MaxLowFrac',          0.35, ...
+    'TissueCeilingHU',     150, ...
+    'MinFillRatio',        0.50, ...
+    'LowDensityFillRatio', 0.75, ...
+    'DensityScale',        [], ...
+    'CorePrctile',         [], ...
+    'FMMThreshMax',        [], ...
+    'TissueScrub',         [], ...
+    'MinBoneHU',           [], ...
+    'MeshSmoothIterations', 8, ...
+    'MeshSmoothLambda',    0.5, ...
+    'MeshPreSmoothSigma',  1.0, ...
+    'MeshDecimate',        0.5 ...
 );
 opts = utils.parse_opts(opts, varargin{:});
 
@@ -93,10 +132,42 @@ fprintf('       Volume %dx%dx%d  |  spacing [%.3f  %.3f  %.3f] mm  |  HU [%.0f, 
 % ==== Stage 2: Bone Separation ====
 fprintf('[2/6] Separating bones...');
 t2 = tic;
-sep_result = bone.separate_bones(ds, opts);
-n_bones = numel(sep_result.bones);
+sep_result = bone.separate_bones(ds, bone.segment_options(opts));
+sep_result.preset = 'standard';
+sep_result = attach_quality(sep_result, ds, opts);
 fprintf(' done (%.1fs)\n', toc(t2));
-fprintf('       %d bones found, %d markers detected\n\n', n_bones, sep_result.n_tags);
+fprintf('       %d bones found, %d markers detected\n', ...
+    numel(sep_result.bones), sep_result.n_tags);
+print_quality(sep_result);
+
+% ---- Fallback pass for low-density or tissue-contaminated scans ----
+% The standard preset is tuned for healthy cortical bone. When it comes back
+% empty, short, or with a mask that does not look separable from what
+% surrounds it, retry under different assumptions and keep the better of the
+% two. Ties go to the standard pass.
+preset = fallback_preset(sep_result, opts);
+if ~isempty(preset)
+    fprintf('       Fallback: retrying with ''%s'' preset\n', preset);
+    t2b = tic;
+    alt_opts = bone.segment_options(opts, preset);
+    try
+        sep_alt = bone.separate_bones(ds, alt_opts);
+        sep_alt.preset = preset;
+        sep_alt = attach_quality(sep_alt, ds, opts);
+        [take, why] = accept_fallback(sep_result, sep_alt, preset);
+        fprintf('       Fallback (%.1fs): %s — %s\n', toc(t2b), ...
+            ternary(take, 'ACCEPTED', 'rejected'), why);
+        if take
+            sep_result = sep_alt;
+            print_quality(sep_result);
+        end
+    catch ME
+        fprintf('       Fallback failed (%s) — keeping standard result\n', ME.message);
+    end
+end
+fprintf('\n');
+
+n_bones = numel(sep_result.bones);
 
 if n_bones == 0
     warning('No bones found. Check DICOM data and thresholds.');
@@ -286,6 +357,7 @@ if opts.SaveOutputs
     end
 
     % --- Per-bone NIfTI + STL ---
+    mesh_vols = zeros(1, n_bones);
     for bi = 1:n_bones
         bm = sep_result.bones{bi}.mask;
 
@@ -322,46 +394,38 @@ if opts.SaveOutputs
             warning('Voxelized STL save failed for bone %d: %s', bi, ME.message);
         end
 
-        % Smooth anatomical STL (Laplacian-smoothed, decimated)
+        % Smooth anatomical STL (Taubin-smoothed, decimated).
+        % Taubin alternates a shrinking and an inflating pass, so the
+        % surface loses its voxel staircase without pulling in off the
+        % bone the way repeated Laplacian passes do.
         try
             if any(bm(:))
-                smooth_field = smooth3(double(bm), 'gaussian', 7, 1.5);
+                smooth_field = smooth3(double(bm), 'gaussian', 5, opts.MeshPreSmoothSigma);
                 fv_smooth = isosurface(smooth_field, 0.5);
                 if ~isempty(fv_smooth.vertices) && size(fv_smooth.faces, 1) > 100
                     fv_smooth.vertices(:,1) = fv_smooth.vertices(:,1) * ds.spacing(2);
                     fv_smooth.vertices(:,2) = fv_smooth.vertices(:,2) * ds.spacing(1);
                     fv_smooth.vertices(:,3) = fv_smooth.vertices(:,3) * ds.spacing(3);
 
-                    % Iterative Laplacian smoothing for anatomical fidelity
-                    V_s = fv_smooth.vertices;
-                    F_s = fv_smooth.faces;
-                    n_smooth_iters = 15;
-                    lambda = 0.5;
-                    nv = size(V_s, 1);
-                    adj = sparse(nv, nv);
-                    for fi = 1:size(F_s, 1)
-                        adj(F_s(fi,1), F_s(fi,2)) = 1; adj(F_s(fi,2), F_s(fi,1)) = 1;
-                        adj(F_s(fi,2), F_s(fi,3)) = 1; adj(F_s(fi,3), F_s(fi,2)) = 1;
-                        adj(F_s(fi,3), F_s(fi,1)) = 1; adj(F_s(fi,1), F_s(fi,3)) = 1;
-                    end
-                    valence = full(sum(adj, 2));
-                    valence(valence == 0) = 1;
-                    for iter = 1:n_smooth_iters
-                        V_neighbor = adj * V_s;
-                        V_avg = V_neighbor ./ valence;
-                        V_s = V_s + lambda * (V_avg - V_s);
-                    end
+                    V_s = meshing.smooth_mesh_taubin(fv_smooth.vertices, ...
+                        fv_smooth.faces, opts.MeshSmoothIterations, ...
+                        opts.MeshSmoothLambda);
 
-                    smooth_mesh = struct('vertices', V_s, 'faces', F_s);
+                    smooth_mesh = struct('vertices', V_s, 'faces', fv_smooth.faces);
                     meshing.write_stl_binary( ...
                         fullfile(outDir, sprintf('bone_%02d_smooth.stl', bi)), ...
-                        smooth_mesh, 'Decimate', 0.3);
+                        smooth_mesh, 'Decimate', opts.MeshDecimate);
+
+                    % How far the smoothing moved the surface, as a check
+                    % that it is not quietly eating the bone.
+                    mesh_vols(bi) = mesh_volume(V_s, fv_smooth.faces);
                 end
             end
         catch ME
             warning('Smooth STL save failed for bone %d: %s', bi, ME.message);
         end
     end
+
 
     % --- Text summary ---
     try
@@ -372,8 +436,21 @@ if opts.SaveOutputs
     end
 
     fprintf(' done (%.1fs)\n', toc(t6));
+
+    % How far smoothing moved the surface, as a check that it is not
+    % quietly eating the bone.
+    for bi = 1:n_bones
+        if mesh_vols(bi) > 0
+            mask_vol = sep_result.bones{bi}.volume_mm3;
+            fprintf('       Bone #%d smooth STL %.0f mm3 vs mask %.0f mm3 (%+.1f%%)\n', ...
+                bi, mesh_vols(bi), mask_vol, ...
+                (mesh_vols(bi) / max(mask_vol, eps) - 1) * 100);
+        end
+    end
+
     fprintf('       Output: %s\n\n', outDir);
     out.outputDir = outDir;
+    out.meshVolumes = mesh_vols;
 else
     fprintf('[6/6] Output saving skipped\n\n');
 end
@@ -438,6 +515,26 @@ else
     fprintf('  %-6s  %8.0f mm3\n', 'TOTAL', total_vol);
 end
 
+% --- Segmentation quality ---
+fprintf('\n  Segmentation pass: %s\n', sep_result.preset);
+needs_review = false;
+for bi = 1:n_bones
+    if ~isfield(sep_result.bones{bi}, 'quality'), continue; end
+    q = sep_result.bones{bi}.quality;
+    if isempty(q.flags)
+        flag_str = 'ok';
+    else
+        flag_str = strjoin(q.flags, ', ');
+        needs_review = true;
+    end
+    fprintf('  #%d  core %.0f HU  rind %.0f HU  contrast %.0f  %.0f%% low  ->  %s\n', ...
+        bi, q.core_hu, q.rind_hu, q.contrast, q.low_frac * 100, flag_str);
+end
+if needs_review
+    fprintf('\n  Flagged bones are the best this data supports — check them by eye\n');
+    fprintf('  before using them; the flag says why, not that the mask is wrong.\n');
+end
+
 % --- Packing summary table ---
 has_packing = ~isempty(pack_results) && ~isempty(pack_results{1}) && ...
     isstruct(pack_results{1}) && isfield(pack_results{1}, 'n_total');
@@ -498,6 +595,141 @@ end
 %  Local helper functions
 % =========================================================================
 
+function sep = attach_quality(sep, ds, opts)
+% Score every bone against the material around it.
+    for bi = 1:numel(sep.bones)
+        qo = struct( ...
+            'LowDensityHU',    opts.LowDensityHU, ...
+            'MinContrastHU',   opts.MinContrastHU, ...
+            'MaxLowFrac',      opts.MaxLowFrac, ...
+            'TissueCeilingHU', opts.TissueCeilingHU, ...
+            'MinFillRatio',    opts.MinFillRatio, ...
+            'SourceVolMM3',    0);
+        if isfield(sep.bones{bi}, 'source_vol_mm3')
+            qo.SourceVolMM3 = sep.bones{bi}.source_vol_mm3;
+        end
+        sep.bones{bi}.quality = bone.mask_quality( ...
+            ds.HU, sep.bones{bi}.mask, ds.spacing, qo);
+    end
+end
+
+
+function print_quality(sep)
+    for bi = 1:numel(sep.bones)
+        q = sep.bones{bi}.quality;
+        if isempty(q.flags)
+            flag_str = 'ok';
+        else
+            flag_str = strjoin(q.flags, ', ');
+        end
+        fprintf('       Bone #%d [%s]: core %.0f HU, rind %.0f HU, contrast %.0f, %.0f%% low — %s\n', ...
+            bi, sep.preset, q.core_hu, q.rind_hu, q.contrast, q.low_frac * 100, flag_str);
+    end
+end
+
+
+function preset = fallback_preset(sep, opts)
+% Decide whether a second pass is worth running, and under which assumption.
+% Low density on its own is not a failure — plenty of osteoporotic bone
+% segments cleanly — so it only triggers a retry when the mask also came
+% back noticeably short of the blob it grew from.
+    preset = '';
+    if ~opts.Fallback, return; end
+
+    if ~isempty(opts.FallbackPreset)
+        if strcmpi(opts.FallbackPreset, 'none'), return; end
+        preset = lower(char(opts.FallbackPreset));
+        return;
+    end
+
+    if isempty(sep.bones)
+        preset = 'lowdensity';
+        return;
+    end
+
+    q = sep.bones{1}.quality;   % the largest bone decides
+    if any(strcmp(q.flags, 'tissue_suspect'))
+        preset = 'tissue';
+    elseif any(strcmp(q.flags, 'under_segmented'))
+        preset = 'lowdensity';
+    elseif any(strcmp(q.flags, 'low_density')) && ...
+           q.fill_ratio > 0 && q.fill_ratio < opts.LowDensityFillRatio
+        preset = 'lowdensity';
+    end
+end
+
+
+function [take, why] = accept_fallback(sep_std, sep_alt, preset)
+% Keep the fallback only when it clearly beats the standard pass. Anything
+% ambiguous keeps the standard result — the point of the fallback is to
+% rescue scans that failed, not to second-guess ones that worked.
+    take = false;
+
+    if isempty(sep_alt.bones)
+        why = 'fallback found no bone';
+        return;
+    end
+    if isempty(sep_std.bones)
+        take = true;
+        why = 'standard pass found no bone';
+        return;
+    end
+
+    a = sep_alt.bones{1};  qa = a.quality;
+    s = sep_std.bones{1};  qs = s.quality;
+    vol_ratio = a.volume_mm3 / max(s.volume_mm3, eps);
+
+    switch preset
+        case 'lowdensity'
+            grew = vol_ratio > 1.05;
+            % A bigger mask that is no longer separable from its
+            % surroundings is tissue, not recovered bone.
+            held_up = qa.score >= qs.score - 0.05;
+            new_tissue = any(strcmp(qa.flags, 'tissue_suspect')) && ...
+                        ~any(strcmp(qs.flags, 'tissue_suspect'));
+            take = grew && held_up && ~new_tissue;
+            if new_tissue
+                why = sprintf('%.0f%% larger but now tissue-suspect', (vol_ratio-1)*100);
+            elseif ~grew
+                why = sprintf('no larger than standard (%.0f%%)', vol_ratio*100);
+            elseif ~held_up
+                why = sprintf('grew %.0f%% but score fell %.2f to %.2f', ...
+                    (vol_ratio-1)*100, qs.score - qa.score, qa.score);
+            else
+                why = sprintf('recovered %.0f%% more bone, score %.2f vs %.2f', ...
+                    (vol_ratio-1)*100, qa.score, qs.score);
+            end
+
+        case 'tissue'
+            cleaner = qa.score > qs.score + 0.05;
+            % Stripping tissue should trim the mask, not gut it.
+            intact = vol_ratio > 0.5;
+            take = cleaner && intact;
+            if ~cleaner
+                why = sprintf('no cleaner (score %.2f vs %.2f)', qa.score, qs.score);
+            elseif ~intact
+                why = sprintf('removed too much (%.0f%% of standard)', vol_ratio*100);
+            else
+                why = sprintf('score %.2f vs %.2f, kept %.0f%% of volume', ...
+                    qa.score, qs.score, vol_ratio*100);
+            end
+
+        otherwise
+            take = qa.score > qs.score + 0.05;
+            why = sprintf('score %.2f vs %.2f', qa.score, qs.score);
+    end
+end
+
+
+function v = mesh_volume(V, F)
+% Enclosed volume of a closed triangle mesh (divergence theorem).
+    v = 0;
+    if isempty(V) || isempty(F), return; end
+    v1 = V(F(:,1), :);  v2 = V(F(:,2), :);  v3 = V(F(:,3), :);
+    v = abs(sum(dot(v1, cross(v2, v3, 2), 2))) / 6;
+end
+
+
 function write_mask_nifti(filename, mask, ds)
     data = int16(mask) * 1000;
     write_volume_nifti(filename, data, ds);
@@ -537,7 +769,11 @@ function write_summary_file(filepath, ds, sep_result, seg_results, pack_results,
         ds.size(1), ds.size(2), ds.size(3), ds.spacing);
     fprintf(fid, 'HU range: [%.0f, %.0f]\n\n', min(ds.HU(:)), max(ds.HU(:)));
     fprintf(fid, 'Bones   : %d\n', n_bones);
-    fprintf(fid, 'Markers : %d\n\n', sep_result.n_tags);
+    fprintf(fid, 'Markers : %d\n', sep_result.n_tags);
+    if isfield(sep_result, 'preset')
+        fprintf(fid, 'Pass    : %s\n', sep_result.preset);
+    end
+    fprintf(fid, '\n');
 
     for bi = 1:n_bones
         b = sep_result.bones{bi};
@@ -556,6 +792,12 @@ function write_summary_file(filepath, ds, sep_result, seg_results, pack_results,
         else
             fprintf(fid, 'Bone %d: %.1f mm3 | HU %.0f | %s\n', ...
                 bi, b.volume_mm3, b.mean_hu, tag_str);
+        end
+        if isfield(b, 'quality')
+            q = b.quality;
+            if isempty(q.flags), flag_str = 'ok'; else, flag_str = strjoin(q.flags, ', '); end
+            fprintf(fid, '  Quality: core %.0f HU, rind %.0f HU, contrast %.0f, %.0f%% low-HU -> %s\n', ...
+                q.core_hu, q.rind_hu, q.contrast, q.low_frac * 100, flag_str);
         end
     end
 
